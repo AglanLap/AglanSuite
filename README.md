@@ -34,7 +34,7 @@ Allows precise measurement from calibrated images.
 ### PublishReady – Image Editor
 Prepare images to meet scientific publication standards.
 
-![PublishReady](assets/screenshots/assembly3d-view.jpg)
+![PublishReady](assets/screenshots/Aglan_PublishReady.jpg)
 ---
 ### ViewsBox 3D
 Export six clean 3D views for publication and museum presentation.
@@ -45,7 +45,7 @@ Export six clean 3D views for publication and museum presentation.
 ### Assembly2D – Fragment Reconstruction
 Digitally assemble 2D fragments with precise scaling, clean cutouts, and publication-ready export.
 
-![Assembly3D](assets/screenshots/assembly3d-view.jpg)
+![Assembly3D](assets/screenshots/assembly2d.jpg)
 
 ### Assembly3D – Fragment Reconstruction
 3D environment for assembling archaeological fragments.
@@ -58,7 +58,7 @@ Digitally assemble 2D fragments with precise scaling, clean cutouts, and publica
 ### ImageSync DB – Fragment Reconstruction
 3D environment for assembling archaeological fragments.
 
-![ImageSync_DB](assets/screenshots/assembly3d-view.jpg)
+![ImageSync_DB](assets/screenshots/ImageSync-DB.jpg)
 
 ## About the Project
 
