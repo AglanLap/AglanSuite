@@ -3,6 +3,7 @@
 A growing platform of specialized applications designed to support archaeological documentation, measurement, reconstruction, and publication.
 
 ![Aglan Suite](assets/screenshots/home-page.jpg)
+![Aglan Suite](assets/screenshots/Aglan_apps.jpg)
 
 ---
 ## Core Capabilities
