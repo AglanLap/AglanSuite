@@ -1,6 +1,8 @@
-# AglanSuite – Archaeology-focused digital tools
+# AglanSuite
 
-A growing platform of specialized applications designed to support archaeological documentation, measurement, reconstruction, and publication.
+AglanSuite is a growing platform of specialized digital tools for archaeological documentation, measurement, reconstruction, publication, and digital archiving.
+
+Official website: https://www.aglansuite.com
 
 ![Aglan Suite](assets/screenshots/home-page.jpg)
 ![Aglan Suite](assets/screenshots/Aglan_apps.jpg)
