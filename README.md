@@ -26,7 +26,7 @@ A tool for calculating object diameters based on arc segments in images.
 ### ScanSnap – Image-based Measurement
 Allows precise measurement from calibrated images.
 
-![ScanSnap](assets/screenshots/scanesnap-ui.png)
+![ScanSnap](assets/screenshots/Aglan_ScaneSnap.jpg)
 
 ---
 
