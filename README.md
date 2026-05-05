@@ -18,7 +18,7 @@ A growing platform of specialized applications designed to support archaeologica
 ### DiaSnap – Diameter from Arc Analysis
 A tool for calculating object diameters based on arc segments in images.
 
-![DiaSnap](assets/screenshots/diasnap-ui.png)
+![DiaSnap](assets/screenshots/Aglan_DiaSnap.jpg)
 
 ---
 
