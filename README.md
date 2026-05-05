@@ -30,12 +30,29 @@ Allows precise measurement from calibrated images.
 
 ---
 
+### PublishReady – Fragment Reconstruction
+3D environment for assembling archaeological fragments.
+
+![Assembly3D](assets/screenshots/assembly3d-view.jpg)
+---
+
+### Assembly2D – Fragment Reconstruction
+3D environment for assembling archaeological fragments.
+
+![Assembly3D](assets/screenshots/assembly3d-view.jpg)
+
 ### Assembly3D – Fragment Reconstruction
 3D environment for assembling archaeological fragments.
 
 ![Assembly3D](assets/screenshots/assembly3d-view.jpg)
 
 ---
+
+
+### ImageSync_DB – Fragment Reconstruction
+3D environment for assembling archaeological fragments.
+
+![Assembly3D](assets/screenshots/assembly3d-view.jpg)
 
 ## About the Project
 
