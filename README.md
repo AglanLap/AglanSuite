@@ -30,14 +30,19 @@ Allows precise measurement from calibrated images.
 
 ---
 
-### PublishReady – Fragment Reconstruction
-3D environment for assembling archaeological fragments.
+### PublishReady – Image Editor
+Prepare images to meet scientific publication standards.
 
-![Assembly3D](assets/screenshots/assembly3d-view.jpg)
+![PublishReady](assets/screenshots/assembly3d-view.jpg)
+---
+### ViewsBox 3D
+Export six clean 3D views for publication and museum presentation.
+
+![ViewsBox 3D](assets/screenshots/assembly3d-view.jpg)
 ---
 
 ### Assembly2D – Fragment Reconstruction
-3D environment for assembling archaeological fragments.
+Digitally assemble 2D fragments with precise scaling, clean cutouts, and publication-ready export.
 
 ![Assembly3D](assets/screenshots/assembly3d-view.jpg)
 
@@ -49,10 +54,10 @@ Allows precise measurement from calibrated images.
 ---
 
 
-### ImageSync_DB – Fragment Reconstruction
+### ImageSync DB – Fragment Reconstruction
 3D environment for assembling archaeological fragments.
 
-![Assembly3D](assets/screenshots/assembly3d-view.jpg)
+![ImageSync_DB](assets/screenshots/assembly3d-view.jpg)
 
 ## About the Project
 
