@@ -39,7 +39,7 @@ Prepare images to meet scientific publication standards.
 ### ViewsBox 3D
 Export six clean 3D views for publication and museum presentation.
 
-![ViewsBox 3D](assets/screenshots/assembly3d-view.jpg)
+![ViewsBox 3D](assets/screenshots/ViewBox3d.jpg)
 ---
 
 ### Assembly2D – Fragment Reconstruction
