@@ -20,7 +20,7 @@ from fastapi.responses import JSONResponse
 
 app = FastAPI(
     title="VectorImage Worker",
-    version="0.5.0",
+    version="0.5.1",
 )
 
 API_TOKEN = os.environ.get(
@@ -28,11 +28,22 @@ API_TOKEN = os.environ.get(
     "",
 ).strip()
 
-PIPELINE_NAME = "archaeological-line-detector-v3"
+PIPELINE_NAME = "archaeological-line-detector-v3.1"
 
 GROUP_OUTER = "01_Outer_Contour"
 GROUP_STRUCTURAL = "02_Structural_Lines"
 GROUP_FINE = "03_Fine_Detail"
+
+
+# ============================================================
+# FINE-DETAIL DEDUPLICATION SETTINGS
+# ============================================================
+
+FINE_MAX_DISTANCE_PX = 5.0
+FINE_MAX_ANGLE_DIFF_DEG = 8.0
+FINE_MIN_OVERLAP_RATIO = 0.60
+
+DEFAULT_FINE_DETAIL_CAP = 800
 
 
 # ============================================================
@@ -139,12 +150,8 @@ def build_subject_mask(
     image_bgr: np.ndarray,
 ) -> np.ndarray:
     """
-    Designed for an archaeological object
-    photographed against a predominantly dark
-    background.
-
-    Uses Otsu thresholding and keeps the largest
-    foreground component.
+    Segment a predominantly lighter archaeological object
+    photographed against a predominantly dark background.
     """
 
     gray = cv2.cvtColor(
@@ -205,7 +212,7 @@ def build_subject_mask(
         thickness=cv2.FILLED,
     )
 
-    # Slight dilation avoids clipping edge details.
+    # Preserve archaeological detail close to damaged edges.
     mask = cv2.dilate(
         mask,
         cv2.getStructuringElement(
@@ -297,9 +304,18 @@ def extract_outer_contour(
 # LINE GEOMETRY
 # ============================================================
 
+Line = Tuple[
+    float,
+    float,
+    float,
+    float,
+]
+
+
 def line_length(
-    line: Tuple[float, float, float, float],
+    line: Line,
 ) -> float:
+
     x1, y1, x2, y2 = line
 
     return math.hypot(
@@ -308,9 +324,13 @@ def line_length(
     )
 
 
-def line_angle_degrees(
-    line: Tuple[float, float, float, float],
+def line_angle_raw(
+    line: Line,
 ) -> float:
+    """
+    Return undirected angle in the range 0..180.
+    """
+
     x1, y1, x2, y2 = line
 
     angle = math.degrees(
@@ -320,10 +340,47 @@ def line_angle_degrees(
         )
     )
 
-    angle = abs(angle)
+    angle %= 180.0
 
-    if angle > 180:
-        angle %= 180
+    return angle
+
+
+def line_angle_difference(
+    line_a: Line,
+    line_b: Line,
+) -> float:
+    """
+    Smallest undirected difference between two lines.
+
+    Example:
+    2 degrees vs 178 degrees -> 4 degrees.
+    """
+
+    a = line_angle_raw(
+        line_a
+    )
+
+    b = line_angle_raw(
+        line_b
+    )
+
+    difference = abs(
+        a - b
+    )
+
+    return min(
+        difference,
+        180.0 - difference,
+    )
+
+
+def line_angle_degrees(
+    line: Line,
+) -> float:
+
+    angle = line_angle_raw(
+        line
+    )
 
     if angle > 90:
         angle = 180 - angle
@@ -332,9 +389,10 @@ def line_angle_degrees(
 
 
 def classify_orientation(
-    line: Tuple[float, float, float, float],
+    line: Line,
     tolerance: float = 12.0,
 ) -> str:
+
     angle = line_angle_degrees(
         line
     )
@@ -351,8 +409,9 @@ def classify_orientation(
 
 
 def normalize_line_direction(
-    line: Tuple[float, float, float, float],
-) -> Tuple[float, float, float, float]:
+    line: Line,
+) -> Line:
+
     x1, y1, x2, y2 = line
 
     if (
@@ -372,6 +431,18 @@ def normalize_line_direction(
     return line
 
 
+def line_midpoint(
+    line: Line,
+) -> Tuple[float, float]:
+
+    x1, y1, x2, y2 = line
+
+    return (
+        (x1 + x2) / 2.0,
+        (y1 + y2) / 2.0,
+    )
+
+
 # ============================================================
 # FAST LINE DETECTOR
 # ============================================================
@@ -380,17 +451,6 @@ def create_fast_line_detector(
     min_length: int,
     edge_threshold: int,
 ):
-    """
-    OpenCV contrib Fast Line Detector.
-
-    Signature:
-    length_threshold
-    distance_threshold
-    canny_th1
-    canny_th2
-    canny_aperture_size
-    do_merge
-    """
 
     low = float(
         clamp(
@@ -426,16 +486,9 @@ def detect_line_segments(
     subject_mask: np.ndarray,
     min_length: int,
     edge_threshold: int,
-) -> List[
-    Tuple[
-        float,
-        float,
-        float,
-        float,
-    ]
-]:
+) -> List[Line]:
 
-    # Edge-preserving denoise.
+    # Edge-preserving denoising.
     filtered = cv2.bilateralFilter(
         enhanced,
         d=7,
@@ -443,9 +496,9 @@ def detect_line_segments(
         sigmaSpace=35,
     )
 
-    # Hide background before line detection.
     working = filtered.copy()
 
+    # Suppress the photographic background.
     working[
         subject_mask == 0
     ] = 255
@@ -465,6 +518,7 @@ def detect_line_segments(
     output = []
 
     for record in detected:
+
         x1, y1, x2, y2 = (
             record[0]
         )
@@ -481,16 +535,16 @@ def detect_line_segments(
         ) < min_length:
             continue
 
-        # Midpoint must lie inside subject mask.
+        # Midpoint must fall inside subject mask.
         mx = int(
             round(
-                (x1 + x2) / 2
+                (x1 + x2) / 2.0
             )
         )
 
         my = int(
             round(
-                (y1 + y2) / 2
+                (y1 + y2) / 2.0
             )
         )
 
@@ -518,28 +572,14 @@ def detect_line_segments(
 
 
 # ============================================================
-# LINE MERGING
+# STRUCTURAL LINE MERGING
 # ============================================================
 
 def merge_horizontal_lines(
-    lines: List[
-        Tuple[
-            float,
-            float,
-            float,
-            float,
-        ]
-    ],
+    lines: List[Line],
     y_tolerance: float,
     gap_tolerance: float,
-) -> List[
-    Tuple[
-        float,
-        float,
-        float,
-        float,
-    ]
-]:
+) -> List[Line]:
 
     if not lines:
         return []
@@ -607,6 +647,7 @@ def merge_horizontal_lines(
                 or overlaps
             )
         ):
+
             current[2] = max(
                 cx2,
                 x2,
@@ -616,11 +657,10 @@ def merge_horizontal_lines(
                 cy + y
             ) / 2.0
 
-            current[3] = (
-                current[1]
-            )
+            current[3] = current[1]
 
         else:
+
             merged.append(
                 tuple(
                     current
@@ -641,24 +681,10 @@ def merge_horizontal_lines(
 
 
 def merge_vertical_lines(
-    lines: List[
-        Tuple[
-            float,
-            float,
-            float,
-            float,
-        ]
-    ],
+    lines: List[Line],
     x_tolerance: float,
     gap_tolerance: float,
-) -> List[
-    Tuple[
-        float,
-        float,
-        float,
-        float,
-    ]
-]:
+) -> List[Line]:
 
     if not lines:
         return []
@@ -726,6 +752,7 @@ def merge_vertical_lines(
                 or overlaps
             )
         ):
+
             current[3] = max(
                 cy2,
                 y2,
@@ -740,6 +767,7 @@ def merge_vertical_lines(
             )
 
         else:
+
             merged.append(
                 tuple(
                     current
@@ -759,56 +787,29 @@ def merge_vertical_lines(
     return merged
 
 
-# ============================================================
-# OBLIQUE FILTERING
-# ============================================================
-
 def filter_oblique_lines(
-    lines: List[
-        Tuple[
-            float,
-            float,
-            float,
-            float,
-        ]
-    ],
+    lines: List[Line],
     min_length: float,
-) -> List[
-    Tuple[
-        float,
-        float,
-        float,
-        float,
-    ]
-]:
-    """
-    Keep only relatively long oblique structures.
+) -> List[Line]:
 
-    This aggressively suppresses texture.
-    """
-
-    output = []
-
-    for line in lines:
-
+    return [
+        line
+        for line in lines
         if line_length(
             line
-        ) >= min_length:
-            output.append(
-                line
-            )
-
-    return output
+        ) >= min_length
+    ]
 
 
 # ============================================================
-# DEDUPLICATION
+# SIMPLE LINE DEDUPLICATION
 # ============================================================
 
 def quantized_line_key(
-    line,
+    line: Line,
     precision: int = 3,
 ):
+
     x1, y1, x2, y2 = line
 
     return (
@@ -828,8 +829,9 @@ def quantized_line_key(
 
 
 def deduplicate_lines(
-    lines,
-):
+    lines: List[Line],
+) -> List[Line]:
+
     seen = set()
     result = []
 
@@ -854,20 +856,299 @@ def deduplicate_lines(
 
 
 # ============================================================
-# LINES → SVG PATHS
+# STRUCTURAL-DUPLICATE TEST
+# ============================================================
+
+def point_to_infinite_line_distance(
+    point: Tuple[float, float],
+    line: Line,
+) -> float:
+    """
+    Perpendicular distance from a point to an infinite
+    line defined by structural segment.
+    """
+
+    px, py = point
+
+    x1, y1, x2, y2 = line
+
+    dx = x2 - x1
+    dy = y2 - y1
+
+    denominator = math.hypot(
+        dx,
+        dy,
+    )
+
+    if denominator < 1e-6:
+
+        return math.hypot(
+            px - x1,
+            py - y1,
+        )
+
+    numerator = abs(
+        dy * px
+        - dx * py
+        + x2 * y1
+        - y2 * x1
+    )
+
+    return (
+        numerator
+        / denominator
+    )
+
+
+def projection_interval(
+    line: Line,
+    axis_origin: Tuple[float, float],
+    axis_vector: Tuple[float, float],
+) -> Tuple[float, float]:
+
+    x1, y1, x2, y2 = line
+
+    ox, oy = axis_origin
+    ux, uy = axis_vector
+
+    p1 = (
+        (x1 - ox) * ux
+        + (y1 - oy) * uy
+    )
+
+    p2 = (
+        (x2 - ox) * ux
+        + (y2 - oy) * uy
+    )
+
+    return (
+        min(
+            p1,
+            p2,
+        ),
+        max(
+            p1,
+            p2,
+        ),
+    )
+
+
+def line_overlap_ratio(
+    fine_line: Line,
+    structural_line: Line,
+) -> float:
+    """
+    Project both segments onto the structural line direction.
+
+    Returns overlap as fraction of the fine-detail line length.
+    """
+
+    sx1, sy1, sx2, sy2 = (
+        structural_line
+    )
+
+    dx = (
+        sx2 - sx1
+    )
+
+    dy = (
+        sy2 - sy1
+    )
+
+    structural_length = (
+        math.hypot(
+            dx,
+            dy,
+        )
+    )
+
+    if structural_length < 1e-6:
+        return 0.0
+
+    ux = (
+        dx
+        / structural_length
+    )
+
+    uy = (
+        dy
+        / structural_length
+    )
+
+    origin = (
+        sx1,
+        sy1,
+    )
+
+    fine_min, fine_max = (
+        projection_interval(
+            fine_line,
+            origin,
+            (
+                ux,
+                uy,
+            ),
+        )
+    )
+
+    struct_min, struct_max = (
+        projection_interval(
+            structural_line,
+            origin,
+            (
+                ux,
+                uy,
+            ),
+        )
+    )
+
+    overlap_start = max(
+        fine_min,
+        struct_min,
+    )
+
+    overlap_end = min(
+        fine_max,
+        struct_max,
+    )
+
+    overlap = max(
+        0.0,
+        overlap_end
+        - overlap_start,
+    )
+
+    fine_projected_length = max(
+        1e-6,
+        fine_max
+        - fine_min,
+    )
+
+    return clamp(
+        overlap
+        / fine_projected_length,
+        0.0,
+        1.0,
+    )
+
+
+def is_duplicate_of_structural(
+    fine_line: Line,
+    structural_lines: List[Line],
+    max_distance: float = FINE_MAX_DISTANCE_PX,
+    max_angle_diff: float = FINE_MAX_ANGLE_DIFF_DEG,
+    min_overlap_ratio: float = FINE_MIN_OVERLAP_RATIO,
+) -> bool:
+    """
+    Reject a fine-detail line when a structural line:
+
+    - is within max_distance pixels
+    - differs by <= max_angle_diff degrees
+    - overlaps >= min_overlap_ratio of the fine segment
+    """
+
+    fine_midpoint = line_midpoint(
+        fine_line
+    )
+
+    fine_length = line_length(
+        fine_line
+    )
+
+    if fine_length < 1e-6:
+        return True
+
+    for structural_line in structural_lines:
+
+        # Quick orientation rejection.
+        angle_difference = (
+            line_angle_difference(
+                fine_line,
+                structural_line,
+            )
+        )
+
+        if (
+            angle_difference
+            > max_angle_diff
+        ):
+            continue
+
+        # Distance to structural axis.
+        distance = (
+            point_to_infinite_line_distance(
+                fine_midpoint,
+                structural_line,
+            )
+        )
+
+        if distance > max_distance:
+            continue
+
+        overlap = (
+            line_overlap_ratio(
+                fine_line,
+                structural_line,
+            )
+        )
+
+        if (
+            overlap
+            >= min_overlap_ratio
+        ):
+            return True
+
+    return False
+
+
+def remove_structural_duplicates(
+    fine_lines: List[Line],
+    structural_lines: List[Line],
+) -> Tuple[List[Line], int]:
+
+    filtered = []
+
+    duplicate_count = 0
+
+    for fine_line in fine_lines:
+
+        if is_duplicate_of_structural(
+            fine_line,
+            structural_lines,
+        ):
+            duplicate_count += 1
+            continue
+
+        filtered.append(
+            fine_line
+        )
+
+    return (
+        filtered,
+        duplicate_count,
+    )
+
+
+# ============================================================
+# STRUCTURAL LINES → SVG
 # ============================================================
 
 def line_to_path_record(
-    line,
+    line: Line,
     path_id: str,
+    group: str,
+    path_type: str,
     orientation: str,
     stroke_width: float,
 ):
+
     x1, y1, x2, y2 = line
 
     d = (
-        f"M{round(x1, 2)} {round(y1, 2)} "
-        f"L{round(x2, 2)} {round(y2, 2)}"
+        f"M{round(x1, 2)} "
+        f"{round(y1, 2)} "
+        f"L{round(x2, 2)} "
+        f"{round(y2, 2)}"
     )
 
     return {
@@ -880,8 +1161,8 @@ def line_to_path_record(
         "strokeLinejoin": "round",
         "vectorEffect": "non-scaling-stroke",
         "transform": None,
-        "group": GROUP_STRUCTURAL,
-        "type": "structural",
+        "group": group,
+        "type": path_type,
         "orientation": orientation,
         "lengthPx": round(
             line_length(
@@ -893,81 +1174,80 @@ def line_to_path_record(
 
 
 def structural_paths_from_lines(
-    horizontal,
-    vertical,
-    oblique,
-):
+    horizontal: List[Line],
+    vertical: List[Line],
+    oblique: List[Line],
+) -> List[Dict[str, Any]]:
+
     paths = []
 
-    counter = 1
+    for index, line in enumerate(
+        horizontal,
+        start=1,
+    ):
 
-    for line in horizontal:
         paths.append(
             line_to_path_record(
                 line=line,
                 path_id=(
-                    f"struct_h_{counter}"
+                    f"struct_h_{index}"
                 ),
+                group=GROUP_STRUCTURAL,
+                path_type="structural",
                 orientation="horizontal",
                 stroke_width=1.0,
             )
         )
-        counter += 1
 
-    counter = 1
+    for index, line in enumerate(
+        vertical,
+        start=1,
+    ):
 
-    for line in vertical:
         paths.append(
             line_to_path_record(
                 line=line,
                 path_id=(
-                    f"struct_v_{counter}"
+                    f"struct_v_{index}"
                 ),
+                group=GROUP_STRUCTURAL,
+                path_type="structural",
                 orientation="vertical",
                 stroke_width=1.0,
             )
         )
-        counter += 1
 
-    counter = 1
+    for index, line in enumerate(
+        oblique,
+        start=1,
+    ):
 
-    for line in oblique:
         paths.append(
             line_to_path_record(
                 line=line,
                 path_id=(
-                    f"struct_o_{counter}"
+                    f"struct_o_{index}"
                 ),
+                group=GROUP_STRUCTURAL,
+                path_type="structural",
                 orientation="oblique",
                 stroke_width=0.85,
             )
         )
-        counter += 1
 
     return paths
 
 
 # ============================================================
-# OPTIONAL FINE DETAIL
+# FINE DETAIL
 # ============================================================
 
-def extract_fine_detail_paths(
+def detect_fine_detail_lines(
     enhanced: np.ndarray,
     subject_mask: np.ndarray,
     min_line_length: int,
     line_sensitivity: int,
-    max_paths: int = 1200,
-) -> List[Dict[str, Any]]:
-    """
-    Fine detail is deliberately conservative.
-
-    It uses a second Fast Line Detector pass with
-    lower minimum length, but caps the number of
-    returned paths.
-
-    This is much safer than adaptive-thresholding
-    every local photographic texture.
-    """
+) -> List[Line]:
 
     sensitivity = clamp(
         line_sensitivity,
@@ -992,75 +1272,47 @@ def extract_fine_detail_paths(
     detail_min = max(
         10,
         int(
-            min_line_length * 0.7
+            min_line_length
+            * 0.7
         ),
     )
 
-    lines = detect_line_segments(
+    return detect_line_segments(
         enhanced=enhanced,
         subject_mask=subject_mask,
         min_length=detail_min,
         edge_threshold=threshold,
     )
 
-    # Avoid duplicating the shortest photographic
-    # texture fragments.
-    lines = [
-        line
-        for line in lines
-        if line_length(
-            line
-        ) >= detail_min
-    ]
 
-    # Prefer longest features.
-    lines.sort(
-        key=line_length,
-        reverse=True,
-    )
-
-    lines = lines[
-        :max_paths
-    ]
+def fine_lines_to_paths(
+    fine_lines: List[Line],
+) -> List[Dict[str, Any]]:
 
     paths = []
 
     for index, line in enumerate(
-        lines,
+        fine_lines,
         start=1,
     ):
-        x1, y1, x2, y2 = line
+
+        orientation = (
+            classify_orientation(
+                line
+            )
+        )
 
         paths.append(
-            {
-                "id": (
+            line_to_path_record(
+                line=line,
+                path_id=(
                     f"fine_{index}"
                 ),
-                "d": (
-                    f"M{round(x1, 2)} {round(y1, 2)} "
-                    f"L{round(x2, 2)} {round(y2, 2)}"
-                ),
-                "fill": "none",
-                "stroke": "#000000",
-                "strokeWidth": 0.7,
-                "strokeLinecap": "round",
-                "strokeLinejoin": "round",
-                "vectorEffect": "non-scaling-stroke",
-                "transform": None,
-                "group": GROUP_FINE,
-                "type": "fine-detail",
-                "orientation": (
-                    classify_orientation(
-                        line
-                    )
-                ),
-                "lengthPx": round(
-                    line_length(
-                        line
-                    ),
-                    2,
-                ),
-            }
+                group=GROUP_FINE,
+                path_type="fine-detail",
+                orientation=orientation,
+                stroke_width=0.70,
+            )
         )
 
     return paths
@@ -1073,6 +1325,7 @@ def extract_fine_detail_paths(
 def path_to_svg(
     path: Dict[str, Any],
 ) -> str:
+
     return (
         f'<path '
         f'id="{path["id"]}" '
@@ -1113,6 +1366,7 @@ def build_svg(
     structural_paths,
     fine_paths,
 ):
+
     return f"""<svg
 xmlns="http://www.w3.org/2000/svg"
 width="{width}"
@@ -1131,9 +1385,11 @@ viewBox="0 0 {width} {height}">
 def count_anchors(
     paths,
 ):
+
     total = 0
 
     for path in paths:
+
         d = path.get(
             "d",
             "",
@@ -1150,6 +1406,7 @@ def count_anchors(
 def path_statistics(
     paths,
 ):
+
     lengths = [
         float(
             path.get(
@@ -1203,7 +1460,7 @@ def path_statistics(
 
 
 # ============================================================
-# DIAGNOSTIC IMAGE
+# DIAGNOSTIC PREVIEW
 # ============================================================
 
 def draw_detected_lines(
@@ -1211,13 +1468,16 @@ def draw_detected_lines(
     horizontal,
     vertical,
     oblique,
+    fine_lines,
 ):
+
     preview = cv2.cvtColor(
         gray,
         cv2.COLOR_GRAY2BGR,
     )
 
     for line in horizontal:
+
         x1, y1, x2, y2 = map(
             int,
             line,
@@ -1228,10 +1488,11 @@ def draw_detected_lines(
             (x1, y1),
             (x2, y2),
             (0, 255, 0),
-            1,
+            2,
         )
 
     for line in vertical:
+
         x1, y1, x2, y2 = map(
             int,
             line,
@@ -1242,10 +1503,11 @@ def draw_detected_lines(
             (x1, y1),
             (x2, y2),
             (255, 0, 0),
-            1,
+            2,
         )
 
     for line in oblique:
+
         x1, y1, x2, y2 = map(
             int,
             line,
@@ -1256,6 +1518,21 @@ def draw_detected_lines(
             (x1, y1),
             (x2, y2),
             (0, 0, 255),
+            1,
+        )
+
+    for line in fine_lines:
+
+        x1, y1, x2, y2 = map(
+            int,
+            line,
+        )
+
+        cv2.line(
+            preview,
+            (x1, y1),
+            (x2, y2),
+            (255, 255, 0),
             1,
         )
 
@@ -1270,6 +1547,7 @@ def draw_detected_lines(
 def health():
 
     try:
+
         process = subprocess.run(
             [
                 "potrace",
@@ -1293,7 +1571,9 @@ def health():
     except Exception:
 
         potrace_ok = False
-        potrace_version = "Unavailable"
+        potrace_version = (
+            "Unavailable"
+        )
 
     contrib_ok = bool(
         hasattr(
@@ -1315,9 +1595,21 @@ def health():
         "opencvContrib": contrib_ok,
         "fastLineDetector": contrib_ok,
         "potrace": potrace_ok,
-        "potraceVersion": potrace_version,
+        "potraceVersion": (
+            potrace_version
+        ),
         "pipeline": PIPELINE_NAME,
-        "version": "0.5.0",
+        "version": "0.5.1",
+
+        "fineDetailDeduplication": {
+            "enabled": True,
+            "maxDistancePx":
+                FINE_MAX_DISTANCE_PX,
+            "maxAngleDifferenceDeg":
+                FINE_MAX_ANGLE_DIFF_DEG,
+            "minimumOverlapRatio":
+                FINE_MIN_OVERLAP_RATIO,
+        },
     }
 
 
@@ -1350,23 +1642,26 @@ async def vectorize(
     # --------------------------------------------------------
 
     try:
+
         config = json.loads(
             settings
         )
+
     except Exception:
+
         config = {}
 
     edge_threshold = int(
         config.get(
             "edgeThreshold",
-            60,
+            48,
         )
     )
 
     line_sensitivity = int(
         config.get(
             "lineSensitivity",
-            80,
+            88,
         )
     )
 
@@ -1375,7 +1670,7 @@ async def vectorize(
             "minPathLength",
             config.get(
                 "minimumMeaningfulLineLength",
-                30,
+                20,
             ),
         )
     )
@@ -1385,7 +1680,7 @@ async def vectorize(
             "maxGapReconnect",
             config.get(
                 "maximumGapToReconnect",
-                12,
+                16,
             ),
         )
     )
@@ -1393,7 +1688,7 @@ async def vectorize(
     path_simplification = float(
         config.get(
             "pathSimplification",
-            0.08,
+            0.05,
         )
     )
 
@@ -1407,7 +1702,7 @@ async def vectorize(
     detect_internal_lines = bool(
         config.get(
             "detectInternalLines",
-            False,
+            True,
         )
     )
 
@@ -1435,6 +1730,19 @@ async def vectorize(
         )
     )
 
+    fine_detail_cap = int(
+        config.get(
+            "fineDetailCap",
+            DEFAULT_FINE_DETAIL_CAP,
+        )
+    )
+
+    fine_detail_cap = clamp(
+        fine_detail_cap,
+        0,
+        3000,
+    )
+
     # --------------------------------------------------------
     # LOAD IMAGE
     # --------------------------------------------------------
@@ -1442,6 +1750,7 @@ async def vectorize(
     content = await image.read()
 
     if not content:
+
         return make_error(
             422,
             "EMPTY_IMAGE",
@@ -1460,6 +1769,7 @@ async def vectorize(
     )
 
     if image_bgr is None:
+
         return make_error(
             422,
             "IMAGE_DECODE_FAILED",
@@ -1486,8 +1796,10 @@ async def vectorize(
             gray
         )
 
-        subject_mask = build_subject_mask(
-            image_bgr
+        subject_mask = (
+            build_subject_mask(
+                image_bgr
+            )
         )
 
         if not ignore_background_texture:
@@ -1497,11 +1809,13 @@ async def vectorize(
         # PASS 1 — OUTER CONTOUR
         # ----------------------------------------------------
 
-        outer_paths = extract_outer_contour(
-            subject_mask,
-            simplification=(
-                path_simplification
-            ),
+        outer_paths = (
+            extract_outer_contour(
+                subject_mask,
+                simplification=(
+                    path_simplification
+                ),
+            )
         )
 
         # ----------------------------------------------------
@@ -1513,15 +1827,19 @@ async def vectorize(
             min_path_length,
         )
 
-        detected_lines = detect_line_segments(
-            enhanced=enhanced,
-            subject_mask=subject_mask,
-            min_length=(
-                structural_min_length
-            ),
-            edge_threshold=(
-                edge_threshold
-            ),
+        detected_lines = (
+            detect_line_segments(
+                enhanced=enhanced,
+                subject_mask=(
+                    subject_mask
+                ),
+                min_length=(
+                    structural_min_length
+                ),
+                edge_threshold=(
+                    edge_threshold
+                ),
+            )
         )
 
         horizontal_raw = []
@@ -1538,46 +1856,54 @@ async def vectorize(
             )
 
             if orientation == "horizontal":
+
                 horizontal_raw.append(
                     line
                 )
 
             elif orientation == "vertical":
+
                 vertical_raw.append(
                     line
                 )
 
             else:
+
                 oblique_raw.append(
                     line
                 )
 
-        horizontal = merge_horizontal_lines(
-            horizontal_raw,
-            y_tolerance=4.0,
-            gap_tolerance=max(
-                8,
-                max_gap,
-            ),
+        horizontal = (
+            merge_horizontal_lines(
+                horizontal_raw,
+                y_tolerance=4.0,
+                gap_tolerance=max(
+                    8,
+                    max_gap,
+                ),
+            )
         )
 
-        vertical = merge_vertical_lines(
-            vertical_raw,
-            x_tolerance=4.0,
-            gap_tolerance=max(
-                8,
-                max_gap,
-            ),
+        vertical = (
+            merge_vertical_lines(
+                vertical_raw,
+                x_tolerance=4.0,
+                gap_tolerance=max(
+                    8,
+                    max_gap,
+                ),
+            )
         )
 
-        # Oblique lines must be significantly
-        # longer than normal structural segments.
-        oblique = filter_oblique_lines(
-            oblique_raw,
-            min_length=max(
-                45,
-                structural_min_length * 1.5,
-            ),
+        oblique = (
+            filter_oblique_lines(
+                oblique_raw,
+                min_length=max(
+                    45,
+                    structural_min_length
+                    * 1.5,
+                ),
+            )
         )
 
         horizontal = deduplicate_lines(
@@ -1592,24 +1918,35 @@ async def vectorize(
             oblique
         )
 
+        structural_geometry = (
+            horizontal
+            + vertical
+            + oblique
+        )
+
         structural_paths = (
             structural_paths_from_lines(
-                horizontal,
-                vertical,
-                oblique,
+                horizontal=horizontal,
+                vertical=vertical,
+                oblique=oblique,
             )
         )
 
         # ----------------------------------------------------
-        # PASS 3 — OPTIONAL FINE DETAIL
+        # PASS 3 — FINE DETAIL
         # ----------------------------------------------------
 
         fine_paths = []
 
+        fine_lines_before_dedup = []
+        fine_lines_after_dedup = []
+
+        fine_duplicates_removed = 0
+
         if detect_internal_lines:
 
-            fine_paths = (
-                extract_fine_detail_paths(
+            fine_lines_before_dedup = (
+                detect_fine_detail_lines(
                     enhanced=enhanced,
                     subject_mask=(
                         subject_mask
@@ -1621,18 +1958,56 @@ async def vectorize(
                     line_sensitivity=(
                         line_sensitivity
                     ),
-                    max_paths=(
-                        1200
-                        if preserve_small_details
-                        else 500
-                    ),
                 )
             )
 
-        # Texture is deliberately NOT automatically
-        # added merely because it exists in the photo.
-        #
-        # This flag is kept for API compatibility.
+            # First exact/quantized duplicate cleanup.
+            fine_lines_before_dedup = (
+                deduplicate_lines(
+                    fine_lines_before_dedup
+                )
+            )
+
+            # ------------------------------------------------
+            # NEW v0.5.1:
+            # REMOVE FINE LINES ALREADY EXPLAINED BY
+            # STRUCTURAL GEOMETRY
+            # ------------------------------------------------
+
+            (
+                fine_lines_after_dedup,
+                fine_duplicates_removed,
+            ) = remove_structural_duplicates(
+                fine_lines=(
+                    fine_lines_before_dedup
+                ),
+                structural_lines=(
+                    structural_geometry
+                ),
+            )
+
+            # Prefer longer surviving detail.
+            fine_lines_after_dedup.sort(
+                key=line_length,
+                reverse=True,
+            )
+
+            # Controlled cap.
+            fine_lines_after_dedup = (
+                fine_lines_after_dedup[
+                    :fine_detail_cap
+                ]
+            )
+
+            fine_paths = (
+                fine_lines_to_paths(
+                    fine_lines_after_dedup
+                )
+            )
+
+        # Texture flag kept for API compatibility.
+        # It does not automatically flood the trace
+        # with photographic texture.
         if include_texture:
             pass
 
@@ -1647,6 +2022,7 @@ async def vectorize(
         )
 
         if not all_paths:
+
             return make_error(
                 422,
                 "NO_PATHS_GENERATED",
@@ -1695,12 +2071,16 @@ async def vectorize(
 
         warnings = []
 
-        if len(all_paths) > 2500:
+        if len(
+            all_paths
+        ) > 2500:
+
             warnings.append(
                 "Trace contains a high number of paths."
             )
 
         if fragmentation_ratio > 0.25:
+
             warnings.append(
                 "Trace contains many short fragments."
             )
@@ -1713,11 +2093,16 @@ async def vectorize(
 
         if return_diagnostics:
 
-            line_preview = draw_detected_lines(
-                enhanced,
-                horizontal,
-                vertical,
-                oblique,
+            line_preview = (
+                draw_detected_lines(
+                    gray=enhanced,
+                    horizontal=horizontal,
+                    vertical=vertical,
+                    oblique=oblique,
+                    fine_lines=(
+                        fine_lines_after_dedup
+                    ),
+                )
             )
 
             diagnostics = {
@@ -1731,7 +2116,7 @@ async def vectorize(
                         enhanced
                     ),
 
-                "structuralLinePreview":
+                "structuralAndFineLinePreview":
                     image_to_base64_png(
                         line_preview
                     ),
@@ -1752,6 +2137,7 @@ async def vectorize(
                 "id": GROUP_STRUCTURAL,
                 "label": "Structural Lines",
                 "paths": structural_paths,
+
                 "subgroups": {
                     "horizontal": [
                         path
@@ -1759,8 +2145,7 @@ async def vectorize(
                         in structural_paths
                         if path.get(
                             "orientation"
-                        )
-                        == "horizontal"
+                        ) == "horizontal"
                     ],
 
                     "vertical": [
@@ -1769,8 +2154,7 @@ async def vectorize(
                         in structural_paths
                         if path.get(
                             "orientation"
-                        )
-                        == "vertical"
+                        ) == "vertical"
                     ],
 
                     "oblique": [
@@ -1779,8 +2163,7 @@ async def vectorize(
                         in structural_paths
                         if path.get(
                             "orientation"
-                        )
-                        == "oblique"
+                        ) == "oblique"
                     ],
                 },
             },
@@ -1798,29 +2181,43 @@ async def vectorize(
 
         return {
             "success": True,
-            "requestId": request_id,
 
-            # Keep Base44 contract stable.
-            "provider": "opencv-potrace",
+            "requestId":
+                request_id,
 
-            "pipeline": PIPELINE_NAME,
-            "workerVersion": "0.5.0",
+            # Keep Base44 response contract.
+            "provider":
+                "opencv-potrace",
 
-            "width": width,
-            "height": height,
+            "pipeline":
+                PIPELINE_NAME,
+
+            "workerVersion":
+                "0.5.1",
+
+            "width":
+                width,
+
+            "height":
+                height,
 
             "viewBox":
                 f"0 0 {width} {height}",
 
-            "svg": svg,
+            "svg":
+                svg,
 
-            "paths": all_paths,
+            "paths":
+                all_paths,
 
-            "groups": groups,
+            "groups":
+                groups,
 
             "statistics": {
                 "pathCount":
-                    len(all_paths),
+                    len(
+                        all_paths
+                    ),
 
                 "anchorCount":
                     anchors,
@@ -1863,6 +2260,19 @@ async def vectorize(
                         detected_lines
                     ),
 
+                "fineDetailDetectedBeforeDedup":
+                    len(
+                        fine_lines_before_dedup
+                    ),
+
+                "fineDetailDuplicatesRemoved":
+                    fine_duplicates_removed,
+
+                "fineDetailAfterDedup":
+                    len(
+                        fine_lines_after_dedup
+                    ),
+
                 "averagePathLength":
                     average_length,
 
@@ -1883,9 +2293,11 @@ async def vectorize(
                     ),
             },
 
-            "warnings": warnings,
+            "warnings":
+                warnings,
 
-            "diagnostics": diagnostics,
+            "diagnostics":
+                diagnostics,
 
             "settingsUsed": {
                 "edgeThreshold":
@@ -1915,8 +2327,20 @@ async def vectorize(
                 "includeTexture":
                     include_texture,
 
+                "fineDetailCap":
+                    fine_detail_cap,
+
                 "returnDiagnostics":
                     return_diagnostics,
+
+                "fineDedupMaxDistancePx":
+                    FINE_MAX_DISTANCE_PX,
+
+                "fineDedupMaxAngleDifferenceDeg":
+                    FINE_MAX_ANGLE_DIFF_DEG,
+
+                "fineDedupMinimumOverlapRatio":
+                    FINE_MIN_OVERLAP_RATIO,
             },
         }
 
