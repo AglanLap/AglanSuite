@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import math
 import base64
 import secrets
 import subprocess
@@ -19,7 +20,7 @@ from fastapi.responses import JSONResponse
 
 app = FastAPI(
     title="VectorImage Worker",
-    version="0.4.0",
+    version="0.5.0",
 )
 
 API_TOKEN = os.environ.get(
@@ -27,16 +28,11 @@ API_TOKEN = os.environ.get(
     "",
 ).strip()
 
-
-# ============================================================
-# CONSTANTS
-# ============================================================
+PIPELINE_NAME = "archaeological-line-detector-v3"
 
 GROUP_OUTER = "01_Outer_Contour"
 GROUP_STRUCTURAL = "02_Structural_Lines"
 GROUP_FINE = "03_Fine_Detail"
-
-PIPELINE_NAME = "archaeological-multipass-v2"
 
 
 # ============================================================
@@ -81,7 +77,7 @@ def verify_token(
 
 
 # ============================================================
-# BASIC HELPERS
+# GENERAL HELPERS
 # ============================================================
 
 def clamp(
@@ -91,22 +87,25 @@ def clamp(
 ):
     return max(
         minimum,
-        min(maximum, value),
+        min(
+            maximum,
+            value,
+        ),
     )
 
 
-def np_image_to_base64_png(
+def image_to_base64_png(
     image: np.ndarray,
 ) -> str:
     if image is None:
         return ""
 
-    success, buffer = cv2.imencode(
+    ok, buffer = cv2.imencode(
         ".png",
         image,
     )
 
-    if not success:
+    if not ok:
         return ""
 
     encoded = base64.b64encode(
@@ -123,11 +122,13 @@ def apply_clahe(
     gray: np.ndarray,
 ) -> np.ndarray:
     clahe = cv2.createCLAHE(
-        clipLimit=2.5,
+        clipLimit=2.2,
         tileGridSize=(8, 8),
     )
 
-    return clahe.apply(gray)
+    return clahe.apply(
+        gray
+    )
 
 
 # ============================================================
@@ -138,11 +139,12 @@ def build_subject_mask(
     image_bgr: np.ndarray,
 ) -> np.ndarray:
     """
-    Isolate the archaeological object from a
-    predominantly dark photographic background.
+    Designed for an archaeological object
+    photographed against a predominantly dark
+    background.
 
-    The largest foreground component is treated as
-    the subject.
+    Uses Otsu thresholding and keeps the largest
+    foreground component.
     """
 
     gray = cv2.cvtColor(
@@ -156,7 +158,7 @@ def build_subject_mask(
         0,
     )
 
-    _, threshold = cv2.threshold(
+    _, binary = cv2.threshold(
         blurred,
         0,
         255,
@@ -169,15 +171,15 @@ def build_subject_mask(
         (15, 15),
     )
 
-    cleaned = cv2.morphologyEx(
-        threshold,
+    binary = cv2.morphologyEx(
+        binary,
         cv2.MORPH_CLOSE,
         close_kernel,
         iterations=2,
     )
 
     contours, _ = cv2.findContours(
-        cleaned,
+        binary,
         cv2.RETR_EXTERNAL,
         cv2.CHAIN_APPROX_SIMPLE,
     )
@@ -203,16 +205,13 @@ def build_subject_mask(
         thickness=cv2.FILLED,
     )
 
-    # Slight expansion keeps features close to
-    # damaged object edges.
-    expand_kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (7, 7),
-    )
-
+    # Slight dilation avoids clipping edge details.
     mask = cv2.dilate(
         mask,
-        expand_kernel,
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (7, 7),
+        ),
         iterations=1,
     )
 
@@ -220,132 +219,14 @@ def build_subject_mask(
 
 
 # ============================================================
-# POLYLINE / SVG HELPERS
-# ============================================================
-
-def simplify_points(
-    points: List[Tuple[int, int]],
-    epsilon: float,
-    closed: bool = False,
-) -> List[Tuple[int, int]]:
-    if len(points) < 3:
-        return points
-
-    contour = np.asarray(
-        points,
-        dtype=np.float32,
-    ).reshape(-1, 1, 2)
-
-    approximation = cv2.approxPolyDP(
-        contour,
-        epsilon,
-        closed,
-    )
-
-    return [
-        (
-            int(p[0][0]),
-            int(p[0][1]),
-        )
-        for p in approximation
-    ]
-
-
-def polyline_length(
-    points: List[Tuple[int, int]],
-) -> float:
-    if len(points) < 2:
-        return 0.0
-
-    total = 0.0
-
-    for i in range(
-        1,
-        len(points),
-    ):
-        x1, y1 = points[i - 1]
-        x2, y2 = points[i]
-
-        total += (
-            (x2 - x1) ** 2
-            + (y2 - y1) ** 2
-        ) ** 0.5
-
-    return total
-
-
-def points_to_svg_path(
-    points: List[Tuple[int, int]],
-    closed: bool = False,
-) -> str:
-    if len(points) < 2:
-        return ""
-
-    commands = [
-        f"M{points[0][0]} {points[0][1]}"
-    ]
-
-    for x, y in points[1:]:
-        commands.append(
-            f"L{x} {y}"
-        )
-
-    if closed:
-        commands.append("Z")
-
-    return " ".join(
-        commands
-    )
-
-
-def create_path_record(
-    path_id: str,
-    points: List[Tuple[int, int]],
-    group: str,
-    path_type: str,
-    stroke_width: float,
-    closed: bool = False,
-    orientation: Optional[str] = None,
-) -> Optional[Dict[str, Any]]:
-    if len(points) < 2:
-        return None
-
-    d = points_to_svg_path(
-        points,
-        closed=closed,
-    )
-
-    if not d:
-        return None
-
-    return {
-        "id": path_id,
-        "d": d,
-        "fill": "none",
-        "stroke": "#000000",
-        "strokeWidth": stroke_width,
-        "strokeLinecap": "round",
-        "strokeLinejoin": "round",
-        "vectorEffect": "non-scaling-stroke",
-        "transform": None,
-        "group": group,
-        "type": path_type,
-        "orientation": orientation,
-        "lengthPx": round(
-            polyline_length(points),
-            2,
-        ),
-    }
-
-
-# ============================================================
-# OUTER CONTOUR PASS
+# OUTER CONTOUR
 # ============================================================
 
 def extract_outer_contour(
     subject_mask: np.ndarray,
     simplification: float,
 ) -> List[Dict[str, Any]]:
+
     contours, _ = cv2.findContours(
         subject_mask,
         cv2.RETR_EXTERNAL,
@@ -360,882 +241,733 @@ def extract_outer_contour(
         key=cv2.contourArea,
     )
 
-    raw_points = [
-        (
-            int(point[0][0]),
-            int(point[0][1]),
-        )
-        for point in contour
-    ]
-
     epsilon = max(
         1.0,
-        simplification * 10.0,
+        simplification * 12.0,
     )
 
-    points = simplify_points(
-        raw_points,
-        epsilon=epsilon,
-        closed=True,
+    simplified = cv2.approxPolyDP(
+        contour,
+        epsilon,
+        True,
     )
 
-    path = create_path_record(
-        path_id="outer_1",
-        points=points,
-        group=GROUP_OUTER,
-        path_type="outer-contour",
-        stroke_width=1.4,
-        closed=True,
-        orientation=None,
-    )
-
-    return (
-        [path]
-        if path
-        else []
-    )
-
-
-# ============================================================
-# THINNING
-# ============================================================
-
-def skeletonize(
-    binary: np.ndarray,
-) -> np.ndarray:
-    binary = (
-        binary > 0
-    ).astype(
-        np.uint8
-    ) * 255
-
-    if (
-        hasattr(cv2, "ximgproc")
-        and hasattr(
-            cv2.ximgproc,
-            "thinning",
+    points = [
+        (
+            int(p[0][0]),
+            int(p[0][1]),
         )
-    ):
-        return cv2.ximgproc.thinning(
-            binary,
-            thinningType=(
-                cv2.ximgproc
-                .THINNING_ZHANGSUEN
-            ),
-        )
+        for p in simplified
+    ]
 
-    # Morphological fallback.
-    skeleton = np.zeros_like(
-        binary
-    )
-
-    working = binary.copy()
-
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_CROSS,
-        (3, 3),
-    )
-
-    while True:
-        eroded = cv2.erode(
-            working,
-            kernel,
-        )
-
-        opened = cv2.dilate(
-            eroded,
-            kernel,
-        )
-
-        residue = cv2.subtract(
-            working,
-            opened,
-        )
-
-        skeleton = cv2.bitwise_or(
-            skeleton,
-            residue,
-        )
-
-        working = eroded
-
-        if cv2.countNonZero(
-            working
-        ) == 0:
-            break
-
-    return skeleton
-
-
-# ============================================================
-# SKELETON → POLYLINES
-# ============================================================
-
-NEIGHBOURS = (
-    (-1, -1),
-    (-1, 0),
-    (-1, 1),
-    (0, -1),
-    (0, 1),
-    (1, -1),
-    (1, 0),
-    (1, 1),
-)
-
-
-def get_neighbours(
-    point,
-    pixels,
-):
-    y, x = point
-
-    neighbours = []
-
-    for dy, dx in NEIGHBOURS:
-        candidate = (
-            y + dy,
-            x + dx,
-        )
-
-        if candidate in pixels:
-            neighbours.append(
-                candidate
-            )
-
-    return neighbours
-
-
-def edge_key(
-    a,
-    b,
-):
-    return tuple(
-        sorted(
-            [a, b]
-        )
-    )
-
-
-def skeleton_to_polylines(
-    skeleton: np.ndarray,
-    min_pixels: int,
-    offset_x: int = 0,
-    offset_y: int = 0,
-) -> List[List[Tuple[int, int]]]:
-    ys, xs = np.where(
-        skeleton > 0
-    )
-
-    pixels = set(
-        zip(
-            ys.tolist(),
-            xs.tolist(),
-        )
-    )
-
-    if not pixels:
+    if len(points) < 3:
         return []
 
-    degree = {
-        point: len(
-            get_neighbours(
-                point,
-                pixels,
-            )
+    commands = [
+        f"M{points[0][0]} {points[0][1]}"
+    ]
+
+    for x, y in points[1:]:
+        commands.append(
+            f"L{x} {y}"
         )
-        for point in pixels
-    }
 
-    important = {
-        point
-        for point, value
-        in degree.items()
-        if value != 2
-    }
+    commands.append("Z")
 
-    visited = set()
-    lines = []
+    return [
+        {
+            "id": "outer_1",
+            "d": " ".join(commands),
+            "fill": "none",
+            "stroke": "#000000",
+            "strokeWidth": 1.4,
+            "strokeLinecap": "round",
+            "strokeLinejoin": "round",
+            "vectorEffect": "non-scaling-stroke",
+            "transform": None,
+            "group": GROUP_OUTER,
+            "type": "outer-contour",
+            "orientation": None,
+            "lengthPx": 0,
+        }
+    ]
 
-    def save_line(
-        line,
+
+# ============================================================
+# LINE GEOMETRY
+# ============================================================
+
+def line_length(
+    line: Tuple[float, float, float, float],
+) -> float:
+    x1, y1, x2, y2 = line
+
+    return math.hypot(
+        x2 - x1,
+        y2 - y1,
+    )
+
+
+def line_angle_degrees(
+    line: Tuple[float, float, float, float],
+) -> float:
+    x1, y1, x2, y2 = line
+
+    angle = math.degrees(
+        math.atan2(
+            y2 - y1,
+            x2 - x1,
+        )
+    )
+
+    angle = abs(angle)
+
+    if angle > 180:
+        angle %= 180
+
+    if angle > 90:
+        angle = 180 - angle
+
+    return angle
+
+
+def classify_orientation(
+    line: Tuple[float, float, float, float],
+    tolerance: float = 12.0,
+) -> str:
+    angle = line_angle_degrees(
+        line
+    )
+
+    if angle <= tolerance:
+        return "horizontal"
+
+    if angle >= (
+        90.0 - tolerance
     ):
-        if len(line) < min_pixels:
-            return
+        return "vertical"
 
-        converted = [
-            (
-                x + offset_x,
-                y + offset_y,
+    return "oblique"
+
+
+def normalize_line_direction(
+    line: Tuple[float, float, float, float],
+) -> Tuple[float, float, float, float]:
+    x1, y1, x2, y2 = line
+
+    if (
+        x1 > x2
+        or (
+            x1 == x2
+            and y1 > y2
+        )
+    ):
+        return (
+            x2,
+            y2,
+            x1,
+            y1,
+        )
+
+    return line
+
+
+# ============================================================
+# FAST LINE DETECTOR
+# ============================================================
+
+def create_fast_line_detector(
+    min_length: int,
+    edge_threshold: int,
+):
+    """
+    OpenCV contrib Fast Line Detector.
+
+    Signature:
+    length_threshold
+    distance_threshold
+    canny_th1
+    canny_th2
+    canny_aperture_size
+    do_merge
+    """
+
+    low = float(
+        clamp(
+            edge_threshold * 0.55,
+            10,
+            180,
+        )
+    )
+
+    high = float(
+        clamp(
+            edge_threshold * 1.4,
+            low + 1,
+            255,
+        )
+    )
+
+    return cv2.ximgproc.createFastLineDetector(
+        max(
+            8,
+            int(min_length),
+        ),
+        1.41421356,
+        low,
+        high,
+        3,
+        False,
+    )
+
+
+def detect_line_segments(
+    enhanced: np.ndarray,
+    subject_mask: np.ndarray,
+    min_length: int,
+    edge_threshold: int,
+) -> List[
+    Tuple[
+        float,
+        float,
+        float,
+        float,
+    ]
+]:
+
+    # Edge-preserving denoise.
+    filtered = cv2.bilateralFilter(
+        enhanced,
+        d=7,
+        sigmaColor=35,
+        sigmaSpace=35,
+    )
+
+    # Hide background before line detection.
+    working = filtered.copy()
+
+    working[
+        subject_mask == 0
+    ] = 255
+
+    detector = create_fast_line_detector(
+        min_length=min_length,
+        edge_threshold=edge_threshold,
+    )
+
+    detected = detector.detect(
+        working
+    )
+
+    if detected is None:
+        return []
+
+    output = []
+
+    for record in detected:
+        x1, y1, x2, y2 = (
+            record[0]
+        )
+
+        line = (
+            float(x1),
+            float(y1),
+            float(x2),
+            float(y2),
+        )
+
+        if line_length(
+            line
+        ) < min_length:
+            continue
+
+        # Midpoint must lie inside subject mask.
+        mx = int(
+            round(
+                (x1 + x2) / 2
             )
-            for y, x in line
+        )
+
+        my = int(
+            round(
+                (y1 + y2) / 2
+            )
+        )
+
+        if (
+            mx < 0
+            or my < 0
+            or mx >= subject_mask.shape[1]
+            or my >= subject_mask.shape[0]
+        ):
+            continue
+
+        if subject_mask[
+            my,
+            mx,
+        ] == 0:
+            continue
+
+        output.append(
+            normalize_line_direction(
+                line
+            )
+        )
+
+    return output
+
+
+# ============================================================
+# LINE MERGING
+# ============================================================
+
+def merge_horizontal_lines(
+    lines: List[
+        Tuple[
+            float,
+            float,
+            float,
+            float,
         ]
+    ],
+    y_tolerance: float,
+    gap_tolerance: float,
+) -> List[
+    Tuple[
+        float,
+        float,
+        float,
+        float,
+    ]
+]:
 
-        lines.append(
-            converted
+    if not lines:
+        return []
+
+    normalized = []
+
+    for x1, y1, x2, y2 in lines:
+
+        if x1 > x2:
+            x1, x2 = x2, x1
+            y1, y2 = y2, y1
+
+        average_y = (
+            y1 + y2
+        ) / 2.0
+
+        normalized.append(
+            (
+                x1,
+                average_y,
+                x2,
+                average_y,
+            )
         )
 
-    # Endpoints and junctions.
-    for start in important:
-        neighbours = get_neighbours(
-            start,
-            pixels,
+    normalized.sort(
+        key=lambda item: (
+            item[1],
+            item[0],
+        )
+    )
+
+    merged = []
+
+    current = list(
+        normalized[0]
+    )
+
+    for line in normalized[1:]:
+
+        x1, y, x2, _ = line
+
+        cx1, cy, cx2, _ = current
+
+        same_row = (
+            abs(
+                y - cy
+            )
+            <= y_tolerance
         )
 
-        for neighbour in neighbours:
-            first_edge = edge_key(
-                start,
-                neighbour,
+        close_gap = (
+            x1 - cx2
+            <= gap_tolerance
+        )
+
+        overlaps = (
+            x1 <= cx2
+        )
+
+        if (
+            same_row
+            and (
+                close_gap
+                or overlaps
+            )
+        ):
+            current[2] = max(
+                cx2,
+                x2,
             )
 
-            if first_edge in visited:
-                continue
+            current[1] = (
+                cy + y
+            ) / 2.0
 
-            visited.add(
-                first_edge
+            current[3] = (
+                current[1]
             )
 
-            line = [
-                start,
-                neighbour,
-            ]
-
-            previous = start
-            current = neighbour
-
-            while True:
-                if (
-                    current in important
-                    and current != start
-                ):
-                    break
-
-                candidates = [
-                    candidate
-                    for candidate
-                    in get_neighbours(
-                        current,
-                        pixels,
-                    )
-                    if candidate != previous
-                ]
-
-                if not candidates:
-                    break
-
-                next_point = None
-
-                for candidate in candidates:
-                    candidate_edge = (
-                        edge_key(
-                            current,
-                            candidate,
-                        )
-                    )
-
-                    if (
-                        candidate_edge
-                        not in visited
-                    ):
-                        next_point = candidate
-                        break
-
-                if next_point is None:
-                    break
-
-                visited.add(
-                    edge_key(
-                        current,
-                        next_point,
-                    )
+        else:
+            merged.append(
+                tuple(
+                    current
                 )
+            )
 
-                line.append(
-                    next_point
-                )
-
-                previous = current
-                current = next_point
-
-            save_line(
+            current = list(
                 line
             )
 
-    # Closed loops.
-    for start in pixels:
-        available = []
+    merged.append(
+        tuple(
+            current
+        )
+    )
 
-        for neighbour in get_neighbours(
-            start,
-            pixels,
-        ):
-            candidate_edge = edge_key(
-                start,
-                neighbour,
-            )
+    return merged
 
-            if candidate_edge not in visited:
-                available.append(
-                    neighbour
-                )
 
-        if not available:
-            continue
-
-        neighbour = available[0]
-
-        line = [
-            start,
-            neighbour,
+def merge_vertical_lines(
+    lines: List[
+        Tuple[
+            float,
+            float,
+            float,
+            float,
         ]
+    ],
+    x_tolerance: float,
+    gap_tolerance: float,
+) -> List[
+    Tuple[
+        float,
+        float,
+        float,
+        float,
+    ]
+]:
 
-        visited.add(
-            edge_key(
-                start,
-                neighbour,
+    if not lines:
+        return []
+
+    normalized = []
+
+    for x1, y1, x2, y2 in lines:
+
+        if y1 > y2:
+            x1, x2 = x2, x1
+            y1, y2 = y2, y1
+
+        average_x = (
+            x1 + x2
+        ) / 2.0
+
+        normalized.append(
+            (
+                average_x,
+                y1,
+                average_x,
+                y2,
             )
         )
 
-        previous = start
-        current = neighbour
+    normalized.sort(
+        key=lambda item: (
+            item[0],
+            item[1],
+        )
+    )
 
-        while True:
-            candidates = [
-                candidate
-                for candidate
-                in get_neighbours(
-                    current,
-                    pixels,
-                )
-                if candidate != previous
-            ]
+    merged = []
 
-            next_point = None
+    current = list(
+        normalized[0]
+    )
 
-            for candidate in candidates:
-                candidate_edge = edge_key(
-                    current,
-                    candidate,
-                )
+    for line in normalized[1:]:
 
-                if candidate_edge not in visited:
-                    next_point = candidate
-                    break
+        x, y1, _, y2 = line
 
-            if next_point is None:
-                break
+        cx, cy1, _, cy2 = current
 
-            visited.add(
-                edge_key(
-                    current,
-                    next_point,
+        same_column = (
+            abs(
+                x - cx
+            )
+            <= x_tolerance
+        )
+
+        close_gap = (
+            y1 - cy2
+            <= gap_tolerance
+        )
+
+        overlaps = (
+            y1 <= cy2
+        )
+
+        if (
+            same_column
+            and (
+                close_gap
+                or overlaps
+            )
+        ):
+            current[3] = max(
+                cy2,
+                y2,
+            )
+
+            current[0] = (
+                cx + x
+            ) / 2.0
+
+            current[2] = (
+                current[0]
+            )
+
+        else:
+            merged.append(
+                tuple(
+                    current
                 )
             )
 
-            line.append(
-                next_point
+            current = list(
+                line
             )
 
-            previous = current
-            current = next_point
+    merged.append(
+        tuple(
+            current
+        )
+    )
 
-            if current == start:
-                break
+    return merged
 
-        save_line(
+
+# ============================================================
+# OBLIQUE FILTERING
+# ============================================================
+
+def filter_oblique_lines(
+    lines: List[
+        Tuple[
+            float,
+            float,
+            float,
+            float,
+        ]
+    ],
+    min_length: float,
+) -> List[
+    Tuple[
+        float,
+        float,
+        float,
+        float,
+    ]
+]:
+    """
+    Keep only relatively long oblique structures.
+
+    This aggressively suppresses texture.
+    """
+
+    output = []
+
+    for line in lines:
+
+        if line_length(
+            line
+        ) >= min_length:
+            output.append(
+                line
+            )
+
+    return output
+
+
+# ============================================================
+# DEDUPLICATION
+# ============================================================
+
+def quantized_line_key(
+    line,
+    precision: int = 3,
+):
+    x1, y1, x2, y2 = line
+
+    return (
+        round(
+            x1 / precision
+        ),
+        round(
+            y1 / precision
+        ),
+        round(
+            x2 / precision
+        ),
+        round(
+            y2 / precision
+        ),
+    )
+
+
+def deduplicate_lines(
+    lines,
+):
+    seen = set()
+    result = []
+
+    for line in lines:
+
+        key = quantized_line_key(
             line
         )
 
-    return lines
+        if key in seen:
+            continue
+
+        seen.add(
+            key
+        )
+
+        result.append(
+            line
+        )
+
+    return result
 
 
 # ============================================================
-# COMPONENT FILTERING
+# LINES → SVG PATHS
 # ============================================================
 
-def connected_component_boxes(
-    binary: np.ndarray,
-):
-    count, labels, stats, _ = (
-        cv2.connectedComponentsWithStats(
-            (
-                binary > 0
-            ).astype(
-                np.uint8
-            ),
-            connectivity=8,
-        )
-    )
-
-    components = []
-
-    for label in range(
-        1,
-        count,
-    ):
-        x = int(
-            stats[
-                label,
-                cv2.CC_STAT_LEFT,
-            ]
-        )
-
-        y = int(
-            stats[
-                label,
-                cv2.CC_STAT_TOP,
-            ]
-        )
-
-        width = int(
-            stats[
-                label,
-                cv2.CC_STAT_WIDTH,
-            ]
-        )
-
-        height = int(
-            stats[
-                label,
-                cv2.CC_STAT_HEIGHT,
-            ]
-        )
-
-        area = int(
-            stats[
-                label,
-                cv2.CC_STAT_AREA,
-            ]
-        )
-
-        components.append(
-            (
-                label,
-                x,
-                y,
-                width,
-                height,
-                area,
-            )
-        )
-
-    return labels, components
-
-
-def component_is_line_like(
-    width: int,
-    height: int,
-    area: int,
-    min_area: int,
-    allow_compact: bool = False,
-) -> bool:
-    if area < min_area:
-        return False
-
-    if width <= 0 or height <= 0:
-        return False
-
-    longest = max(
-        width,
-        height,
-    )
-
-    shortest = max(
-        1,
-        min(
-            width,
-            height,
-        ),
-    )
-
-    elongation = (
-        longest / shortest
-    )
-
-    box_area = (
-        width * height
-    )
-
-    density = (
-        area / box_area
-        if box_area
-        else 1.0
-    )
-
-    if allow_compact:
-        return (
-            area >= min_area
-            and density < 0.8
-        )
-
-    return (
-        elongation >= 1.5
-        or (
-            area >= min_area * 3
-            and density < 0.45
-        )
-    )
-
-
-# ============================================================
-# COMPONENT → CENTERLINES
-# ============================================================
-
-def component_centerlines(
-    binary: np.ndarray,
-    min_component_area: int,
-    min_line_pixels: int,
-    simplification: float,
-    prefix: str,
-    group: str,
-    path_type: str,
-    orientation: Optional[str],
+def line_to_path_record(
+    line,
+    path_id: str,
+    orientation: str,
     stroke_width: float,
-    allow_compact: bool = False,
-) -> Tuple[List[Dict[str, Any]], np.ndarray]:
+):
+    x1, y1, x2, y2 = line
 
-    labels, components = (
-        connected_component_boxes(
-            binary
-        )
+    d = (
+        f"M{round(x1, 2)} {round(y1, 2)} "
+        f"L{round(x2, 2)} {round(y2, 2)}"
     )
 
-    all_paths = []
+    return {
+        "id": path_id,
+        "d": d,
+        "fill": "none",
+        "stroke": "#000000",
+        "strokeWidth": stroke_width,
+        "strokeLinecap": "round",
+        "strokeLinejoin": "round",
+        "vectorEffect": "non-scaling-stroke",
+        "transform": None,
+        "group": GROUP_STRUCTURAL,
+        "type": "structural",
+        "orientation": orientation,
+        "lengthPx": round(
+            line_length(
+                line
+            ),
+            2,
+        ),
+    }
 
-    debug_skeleton = np.zeros_like(
-        binary
-    )
+
+def structural_paths_from_lines(
+    horizontal,
+    vertical,
+    oblique,
+):
+    paths = []
 
     counter = 1
 
-    for (
-        label,
-        x,
-        y,
-        width,
-        height,
-        area,
-    ) in components:
-
-        if not component_is_line_like(
-            width=width,
-            height=height,
-            area=area,
-            min_area=min_component_area,
-            allow_compact=allow_compact,
-        ):
-            continue
-
-        padding = 2
-
-        x0 = max(
-            0,
-            x - padding,
-        )
-
-        y0 = max(
-            0,
-            y - padding,
-        )
-
-        x1 = min(
-            binary.shape[1],
-            x + width + padding,
-        )
-
-        y1 = min(
-            binary.shape[0],
-            y + height + padding,
-        )
-
-        label_crop = labels[
-            y0:y1,
-            x0:x1,
-        ]
-
-        component = (
-            label_crop == label
-        ).astype(
-            np.uint8
-        ) * 255
-
-        skeleton = skeletonize(
-            component
-        )
-
-        debug_skeleton[
-            y0:y1,
-            x0:x1,
-        ] = cv2.bitwise_or(
-            debug_skeleton[
-                y0:y1,
-                x0:x1,
-            ],
-            skeleton,
-        )
-
-        polylines = (
-            skeleton_to_polylines(
-                skeleton=skeleton,
-                min_pixels=min_line_pixels,
-                offset_x=x0,
-                offset_y=y0,
-            )
-        )
-
-        epsilon = max(
-            0.5,
-            simplification * 5.0,
-        )
-
-        for polyline in polylines:
-            simplified = simplify_points(
-                polyline,
-                epsilon=epsilon,
-                closed=False,
-            )
-
-            if (
-                polyline_length(
-                    simplified
-                )
-                < min_line_pixels
-            ):
-                continue
-
-            path = create_path_record(
+    for line in horizontal:
+        paths.append(
+            line_to_path_record(
+                line=line,
                 path_id=(
-                    f"{prefix}_{counter}"
+                    f"struct_h_{counter}"
                 ),
-                points=simplified,
-                group=group,
-                path_type=path_type,
-                stroke_width=stroke_width,
-                closed=False,
-                orientation=orientation,
+                orientation="horizontal",
+                stroke_width=1.0,
             )
+        )
+        counter += 1
 
-            if path:
-                all_paths.append(
-                    path
-                )
+    counter = 1
 
-                counter += 1
+    for line in vertical:
+        paths.append(
+            line_to_path_record(
+                line=line,
+                path_id=(
+                    f"struct_v_{counter}"
+                ),
+                orientation="vertical",
+                stroke_width=1.0,
+            )
+        )
+        counter += 1
 
-    return (
-        all_paths,
-        debug_skeleton,
-    )
+    counter = 1
+
+    for line in oblique:
+        paths.append(
+            line_to_path_record(
+                line=line,
+                path_id=(
+                    f"struct_o_{counter}"
+                ),
+                orientation="oblique",
+                stroke_width=0.85,
+            )
+        )
+        counter += 1
+
+    return paths
 
 
 # ============================================================
-# EDGE DETECTION
+# OPTIONAL FINE DETAIL
 # ============================================================
 
-def make_canny_edges(
+def extract_fine_detail_paths(
     enhanced: np.ndarray,
     subject_mask: np.ndarray,
-    edge_threshold: int,
-) -> np.ndarray:
-
-    blurred = cv2.GaussianBlur(
-        enhanced,
-        (3, 3),
-        0,
-    )
-
-    low = clamp(
-        int(edge_threshold * 0.45),
-        5,
-        200,
-    )
-
-    high = clamp(
-        int(edge_threshold * 1.45),
-        low + 1,
-        255,
-    )
-
-    edges = cv2.Canny(
-        blurred,
-        low,
-        high,
-    )
-
-    return cv2.bitwise_and(
-        edges,
-        edges,
-        mask=subject_mask,
-    )
-
-
-# ============================================================
-# STRUCTURAL SUBPASSES
-# ============================================================
-
-def horizontal_structure_mask(
-    edges: np.ndarray,
-    max_gap: int,
-) -> np.ndarray:
-
-    gap = clamp(
-        max_gap,
-        3,
-        30,
-    )
-
-    reconnect_kernel = (
-        cv2.getStructuringElement(
-            cv2.MORPH_RECT,
-            (
-                gap,
-                1,
-            ),
-        )
-    )
-
-    reconnected = cv2.morphologyEx(
-        edges,
-        cv2.MORPH_CLOSE,
-        reconnect_kernel,
-        iterations=1,
-    )
-
-    # Reject features with almost no horizontal
-    # extent.
-    selector_length = max(
-        7,
-        gap,
-    )
-
-    selector = (
-        cv2.getStructuringElement(
-            cv2.MORPH_RECT,
-            (
-                selector_length,
-                1,
-            ),
-        )
-    )
-
-    horizontal = cv2.morphologyEx(
-        reconnected,
-        cv2.MORPH_OPEN,
-        selector,
-        iterations=1,
-    )
-
-    return horizontal
-
-
-def vertical_structure_mask(
-    edges: np.ndarray,
-    max_gap: int,
-) -> np.ndarray:
-
-    gap = clamp(
-        max_gap,
-        3,
-        30,
-    )
-
-    reconnect_kernel = (
-        cv2.getStructuringElement(
-            cv2.MORPH_RECT,
-            (
-                1,
-                gap,
-            ),
-        )
-    )
-
-    reconnected = cv2.morphologyEx(
-        edges,
-        cv2.MORPH_CLOSE,
-        reconnect_kernel,
-        iterations=1,
-    )
-
-    selector_length = max(
-        7,
-        gap,
-    )
-
-    selector = (
-        cv2.getStructuringElement(
-            cv2.MORPH_RECT,
-            (
-                1,
-                selector_length,
-            ),
-        )
-    )
-
-    vertical = cv2.morphologyEx(
-        reconnected,
-        cv2.MORPH_OPEN,
-        selector,
-        iterations=1,
-    )
-
-    return vertical
-
-
-def irregular_structure_mask(
-    edges: np.ndarray,
-    horizontal: np.ndarray,
-    vertical: np.ndarray,
-) -> np.ndarray:
-
-    known_structures = cv2.bitwise_or(
-        horizontal,
-        vertical,
-    )
-
-    # Slight dilation prevents the irregular pass
-    # from tracing the same structural feature again.
-    exclusion_kernel = np.ones(
-        (3, 3),
-        np.uint8,
-    )
-
-    exclusion = cv2.dilate(
-        known_structures,
-        exclusion_kernel,
-        iterations=1,
-    )
-
-    irregular = cv2.bitwise_and(
-        edges,
-        cv2.bitwise_not(
-            exclusion
-        ),
-    )
-
-    # Reconnect only very small local breaks.
-    irregular = cv2.morphologyEx(
-        irregular,
-        cv2.MORPH_CLOSE,
-        np.ones(
-            (2, 2),
-            np.uint8,
-        ),
-        iterations=1,
-    )
-
-    return irregular
-
-
-# ============================================================
-# FINE DETAIL PASS
-# ============================================================
-
-def fine_detail_mask(
-    enhanced: np.ndarray,
-    subject_mask: np.ndarray,
+    min_line_length: int,
     line_sensitivity: int,
-    structural_mask: np.ndarray,
-    include_texture: bool,
-) -> np.ndarray:
+    max_paths: int = 1200,
+) -> List[Dict[str, Any]]:
+    """
+    Fine detail is deliberately conservative.
+
+    It uses a second Fast Line Detector pass with
+    lower minimum length, but caps the number of
+    returned paths.
+
+    This is much safer than adaptive-thresholding
+    every local photographic texture.
+    """
 
     sensitivity = clamp(
         line_sensitivity,
@@ -1243,104 +975,115 @@ def fine_detail_mask(
         100,
     )
 
-    c_value = int(
-        14
+    threshold = int(
+        75
         - (
             sensitivity
-            / 10.0
+            * 0.35
         )
     )
 
-    c_value = clamp(
-        c_value,
-        2,
-        12,
+    threshold = clamp(
+        threshold,
+        30,
+        70,
     )
 
-    detail = cv2.adaptiveThreshold(
-        enhanced,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,
-        31,
-        c_value,
-    )
-
-    detail = cv2.bitwise_and(
-        detail,
-        detail,
-        mask=subject_mask,
-    )
-
-    # Remove structures already represented in
-    # the structural pass.
-    structural_exclusion = cv2.dilate(
-        structural_mask,
-        np.ones(
-            (3, 3),
-            np.uint8,
-        ),
-        iterations=1,
-    )
-
-    detail = cv2.bitwise_and(
-        detail,
-        cv2.bitwise_not(
-            structural_exclusion
+    detail_min = max(
+        10,
+        int(
+            min_line_length * 0.7
         ),
     )
 
-    if not include_texture:
-        # Remove isolated one/two-pixel photographic
-        # texture without destroying larger linework.
-        detail = cv2.morphologyEx(
-            detail,
-            cv2.MORPH_OPEN,
-            np.ones(
-                (2, 2),
-                np.uint8,
-            ),
-            iterations=1,
+    lines = detect_line_segments(
+        enhanced=enhanced,
+        subject_mask=subject_mask,
+        min_length=detail_min,
+        edge_threshold=threshold,
+    )
+
+    # Avoid duplicating the shortest photographic
+    # texture fragments.
+    lines = [
+        line
+        for line in lines
+        if line_length(
+            line
+        ) >= detail_min
+    ]
+
+    # Prefer longest features.
+    lines.sort(
+        key=line_length,
+        reverse=True,
+    )
+
+    lines = lines[
+        :max_paths
+    ]
+
+    paths = []
+
+    for index, line in enumerate(
+        lines,
+        start=1,
+    ):
+        x1, y1, x2, y2 = line
+
+        paths.append(
+            {
+                "id": (
+                    f"fine_{index}"
+                ),
+                "d": (
+                    f"M{round(x1, 2)} {round(y1, 2)} "
+                    f"L{round(x2, 2)} {round(y2, 2)}"
+                ),
+                "fill": "none",
+                "stroke": "#000000",
+                "strokeWidth": 0.7,
+                "strokeLinecap": "round",
+                "strokeLinejoin": "round",
+                "vectorEffect": "non-scaling-stroke",
+                "transform": None,
+                "group": GROUP_FINE,
+                "type": "fine-detail",
+                "orientation": (
+                    classify_orientation(
+                        line
+                    )
+                ),
+                "lengthPx": round(
+                    line_length(
+                        line
+                    ),
+                    2,
+                ),
+            }
         )
 
-    return detail
+    return paths
 
 
 # ============================================================
-# SVG
+# SVG GENERATION
 # ============================================================
 
 def path_to_svg(
     path: Dict[str, Any],
 ) -> str:
-
-    attributes = [
-        f'id="{path["id"]}"',
-        f'd="{path["d"]}"',
-        'fill="none"',
-        f'stroke="{path.get("stroke", "#000000")}"',
-        (
-            'stroke-width="'
-            f'{path.get("strokeWidth", 1.0)}'
-            '"'
-        ),
-        (
-            'stroke-linecap="'
-            f'{path.get("strokeLinecap", "round")}'
-            '"'
-        ),
-        (
-            'stroke-linejoin="'
-            f'{path.get("strokeLinejoin", "round")}'
-            '"'
-        ),
-        'vector-effect="non-scaling-stroke"',
-    ]
-
     return (
-        "<path "
-        + " ".join(attributes)
-        + " />"
+        f'<path '
+        f'id="{path["id"]}" '
+        f'd="{path["d"]}" '
+        f'fill="none" '
+        f'stroke="{path.get("stroke", "#000000")}" '
+        f'stroke-width="{path.get("strokeWidth", 1.0)}" '
+        f'stroke-linecap="round" '
+        f'stroke-linejoin="round" '
+        f'vector-effect="non-scaling-stroke" '
+        f'/>'
     )
 
 
@@ -1350,25 +1093,26 @@ def svg_group(
 ) -> str:
 
     body = "\n".join(
-        path_to_svg(path)
+        path_to_svg(
+            path
+        )
         for path in paths
     )
 
     return (
         f'<g id="{group_id}">\n'
         f"{body}\n"
-        "</g>"
+        f"</g>"
     )
 
 
 def build_svg(
     width: int,
     height: int,
-    outer_paths: List[Dict[str, Any]],
-    structural_paths: List[Dict[str, Any]],
-    fine_paths: List[Dict[str, Any]],
-) -> str:
-
+    outer_paths,
+    structural_paths,
+    fine_paths,
+):
     return f"""<svg
 xmlns="http://www.w3.org/2000/svg"
 width="{width}"
@@ -1384,9 +1128,9 @@ viewBox="0 0 {width} {height}">
 # STATISTICS
 # ============================================================
 
-def anchor_count(
-    paths: List[Dict[str, Any]],
-) -> int:
+def count_anchors(
+    paths,
+):
     total = 0
 
     for path in paths:
@@ -1395,7 +1139,6 @@ def anchor_count(
             "",
         )
 
-        # This pipeline produces M/L/Z geometry.
         total += (
             d.count("M")
             + d.count("L")
@@ -1405,7 +1148,7 @@ def anchor_count(
 
 
 def path_statistics(
-    paths: List[Dict[str, Any]],
+    paths,
 ):
     lengths = [
         float(
@@ -1417,23 +1160,33 @@ def path_statistics(
         for path in paths
     ]
 
-    usable = [
+    lengths = [
         value
         for value in lengths
         if value > 0
     ]
 
+    if not lengths:
+        return (
+            0.0,
+            0,
+            0.0,
+        )
+
     average = (
-        sum(usable)
-        / len(usable)
-        if usable
-        else 0.0
+        sum(lengths)
+        / len(lengths)
     )
 
     short_count = sum(
         1
-        for value in usable
+        for value in lengths
         if value < 20
+    )
+
+    fragmentation = (
+        short_count
+        / len(lengths)
     )
 
     return (
@@ -1442,7 +1195,71 @@ def path_statistics(
             2,
         ),
         short_count,
+        round(
+            fragmentation,
+            4,
+        ),
     )
+
+
+# ============================================================
+# DIAGNOSTIC IMAGE
+# ============================================================
+
+def draw_detected_lines(
+    gray: np.ndarray,
+    horizontal,
+    vertical,
+    oblique,
+):
+    preview = cv2.cvtColor(
+        gray,
+        cv2.COLOR_GRAY2BGR,
+    )
+
+    for line in horizontal:
+        x1, y1, x2, y2 = map(
+            int,
+            line,
+        )
+
+        cv2.line(
+            preview,
+            (x1, y1),
+            (x2, y2),
+            (0, 255, 0),
+            1,
+        )
+
+    for line in vertical:
+        x1, y1, x2, y2 = map(
+            int,
+            line,
+        )
+
+        cv2.line(
+            preview,
+            (x1, y1),
+            (x2, y2),
+            (255, 0, 0),
+            1,
+        )
+
+    for line in oblique:
+        x1, y1, x2, y2 = map(
+            int,
+            line,
+        )
+
+        cv2.line(
+            preview,
+            (x1, y1),
+            (x2, y2),
+            (0, 0, 255),
+            1,
+        )
+
+    return preview
 
 
 # ============================================================
@@ -1451,6 +1268,7 @@ def path_statistics(
 
 @app.get("/health")
 def health():
+
     try:
         process = subprocess.run(
             [
@@ -1473,10 +1291,9 @@ def health():
         ).strip()
 
     except Exception:
+
         potrace_ok = False
-        potrace_version = (
-            "Unavailable"
-        )
+        potrace_version = "Unavailable"
 
     contrib_ok = bool(
         hasattr(
@@ -1485,7 +1302,7 @@ def health():
         )
         and hasattr(
             cv2.ximgproc,
-            "thinning",
+            "createFastLineDetector",
         )
     )
 
@@ -1496,12 +1313,11 @@ def health():
         "opencv": True,
         "opencvVersion": cv2.__version__,
         "opencvContrib": contrib_ok,
+        "fastLineDetector": contrib_ok,
         "potrace": potrace_ok,
-        "potraceVersion": (
-            potrace_version
-        ),
+        "potraceVersion": potrace_version,
         "pipeline": PIPELINE_NAME,
-        "version": "0.4.0",
+        "version": "0.5.0",
     }
 
 
@@ -1559,7 +1375,7 @@ async def vectorize(
             "minPathLength",
             config.get(
                 "minimumMeaningfulLineLength",
-                8,
+                30,
             ),
         )
     )
@@ -1569,7 +1385,7 @@ async def vectorize(
             "maxGapReconnect",
             config.get(
                 "maximumGapToReconnect",
-                6,
+                12,
             ),
         )
     )
@@ -1591,7 +1407,7 @@ async def vectorize(
     detect_internal_lines = bool(
         config.get(
             "detectInternalLines",
-            True,
+            False,
         )
     )
 
@@ -1670,10 +1486,8 @@ async def vectorize(
             gray
         )
 
-        subject_mask = (
-            build_subject_mask(
-                image_bgr
-            )
+        subject_mask = build_subject_mask(
+            image_bgr
         )
 
         if not ignore_background_texture:
@@ -1683,227 +1497,147 @@ async def vectorize(
         # PASS 1 — OUTER CONTOUR
         # ----------------------------------------------------
 
-        outer_paths = (
-            extract_outer_contour(
-                subject_mask,
-                simplification=(
-                    max(
-                        0.05,
-                        path_simplification,
-                    )
-                ),
-            )
-        )
-
-        # ----------------------------------------------------
-        # BASE STRUCTURAL EDGES
-        # ----------------------------------------------------
-
-        edges = make_canny_edges(
-            enhanced,
+        outer_paths = extract_outer_contour(
             subject_mask,
-            edge_threshold,
-        )
-
-        # ----------------------------------------------------
-        # PASS 2A — HORIZONTAL
-        # ----------------------------------------------------
-
-        horizontal_mask = (
-            horizontal_structure_mask(
-                edges,
-                max_gap,
-            )
-        )
-
-        horizontal_paths, (
-            horizontal_skeleton
-        ) = component_centerlines(
-            binary=horizontal_mask,
-            min_component_area=max(
-                10,
-                min_path_length,
-            ),
-            min_line_pixels=max(
-                6,
-                min_path_length,
-            ),
             simplification=(
                 path_simplification
             ),
-            prefix="struct_h",
-            group=GROUP_STRUCTURAL,
-            path_type="structural",
-            orientation="horizontal",
-            stroke_width=1.0,
         )
 
         # ----------------------------------------------------
-        # PASS 2B — VERTICAL
+        # PASS 2 — STRUCTURAL LINES
         # ----------------------------------------------------
 
-        vertical_mask = (
-            vertical_structure_mask(
-                edges,
+        structural_min_length = max(
+            20,
+            min_path_length,
+        )
+
+        detected_lines = detect_line_segments(
+            enhanced=enhanced,
+            subject_mask=subject_mask,
+            min_length=(
+                structural_min_length
+            ),
+            edge_threshold=(
+                edge_threshold
+            ),
+        )
+
+        horizontal_raw = []
+        vertical_raw = []
+        oblique_raw = []
+
+        for line in detected_lines:
+
+            orientation = (
+                classify_orientation(
+                    line,
+                    tolerance=12.0,
+                )
+            )
+
+            if orientation == "horizontal":
+                horizontal_raw.append(
+                    line
+                )
+
+            elif orientation == "vertical":
+                vertical_raw.append(
+                    line
+                )
+
+            else:
+                oblique_raw.append(
+                    line
+                )
+
+        horizontal = merge_horizontal_lines(
+            horizontal_raw,
+            y_tolerance=4.0,
+            gap_tolerance=max(
+                8,
                 max_gap,
-            )
+            ),
         )
 
-        vertical_paths, (
-            vertical_skeleton
-        ) = component_centerlines(
-            binary=vertical_mask,
-            min_component_area=max(
-                10,
-                min_path_length,
+        vertical = merge_vertical_lines(
+            vertical_raw,
+            x_tolerance=4.0,
+            gap_tolerance=max(
+                8,
+                max_gap,
             ),
-            min_line_pixels=max(
-                6,
-                min_path_length,
-            ),
-            simplification=(
-                path_simplification
-            ),
-            prefix="struct_v",
-            group=GROUP_STRUCTURAL,
-            path_type="structural",
-            orientation="vertical",
-            stroke_width=1.0,
         )
 
-        # ----------------------------------------------------
-        # PASS 2C — IRREGULAR STRUCTURAL
-        # ----------------------------------------------------
-
-        irregular_mask = (
-            irregular_structure_mask(
-                edges,
-                horizontal_mask,
-                vertical_mask,
-            )
+        # Oblique lines must be significantly
+        # longer than normal structural segments.
+        oblique = filter_oblique_lines(
+            oblique_raw,
+            min_length=max(
+                45,
+                structural_min_length * 1.5,
+            ),
         )
 
-        irregular_paths, (
-            irregular_skeleton
-        ) = component_centerlines(
-            binary=irregular_mask,
-            min_component_area=max(
-                15,
-                min_path_length * 2,
-            ),
-            min_line_pixels=max(
-                10,
-                min_path_length,
-            ),
-            simplification=max(
-                0.08,
-                path_simplification,
-            ),
-            prefix="struct_i",
-            group=GROUP_STRUCTURAL,
-            path_type="structural",
-            orientation="irregular",
-            stroke_width=0.9,
+        horizontal = deduplicate_lines(
+            horizontal
+        )
+
+        vertical = deduplicate_lines(
+            vertical
+        )
+
+        oblique = deduplicate_lines(
+            oblique
         )
 
         structural_paths = (
-            horizontal_paths
-            + vertical_paths
-            + irregular_paths
-        )
-
-        structural_mask = (
-            cv2.bitwise_or(
-                horizontal_mask,
-                vertical_mask,
-            )
-        )
-
-        structural_mask = (
-            cv2.bitwise_or(
-                structural_mask,
-                irregular_mask,
+            structural_paths_from_lines(
+                horizontal,
+                vertical,
+                oblique,
             )
         )
 
         # ----------------------------------------------------
-        # PASS 3 — FINE DETAIL
+        # PASS 3 — OPTIONAL FINE DETAIL
         # ----------------------------------------------------
 
         fine_paths = []
 
-        detail_mask = np.zeros_like(
-            gray
-        )
-
-        detail_skeleton = np.zeros_like(
-            gray
-        )
-
         if detect_internal_lines:
 
-            detail_mask = (
-                fine_detail_mask(
+            fine_paths = (
+                extract_fine_detail_paths(
                     enhanced=enhanced,
                     subject_mask=(
                         subject_mask
                     ),
+                    min_line_length=max(
+                        12,
+                        min_path_length,
+                    ),
                     line_sensitivity=(
                         line_sensitivity
                     ),
-                    structural_mask=(
-                        structural_mask
+                    max_paths=(
+                        1200
+                        if preserve_small_details
+                        else 500
                     ),
-                    include_texture=(
-                        include_texture
-                    ),
                 )
             )
 
-            # Fine detail must be filtered heavily.
-            fine_min_area = (
-                8
-                if preserve_small_details
-                else 16
-            )
-
-            fine_min_pixels = (
-                max(
-                    4,
-                    min_path_length // 2,
-                )
-                if preserve_small_details
-                else max(
-                    8,
-                    min_path_length,
-                )
-            )
-
-            fine_paths, (
-                detail_skeleton
-            ) = component_centerlines(
-                binary=detail_mask,
-                min_component_area=(
-                    fine_min_area
-                ),
-                min_line_pixels=(
-                    fine_min_pixels
-                ),
-                simplification=max(
-                    0.05,
-                    path_simplification
-                    * 0.7,
-                ),
-                prefix="fine",
-                group=GROUP_FINE,
-                path_type="fine-detail",
-                orientation=None,
-                stroke_width=0.75,
-                allow_compact=False,
-            )
+        # Texture is deliberately NOT automatically
+        # added merely because it exists in the photo.
+        #
+        # This flag is kept for API compatibility.
+        if include_texture:
+            pass
 
         # ----------------------------------------------------
-        # MERGE
+        # COMBINE
         # ----------------------------------------------------
 
         all_paths = (
@@ -1916,30 +1650,36 @@ async def vectorize(
             return make_error(
                 422,
                 "NO_PATHS_GENERATED",
-                "No usable SVG paths were generated",
+                "No usable vector paths were generated",
                 request_id,
             )
 
         svg = build_svg(
             width=width,
             height=height,
-            outer_paths=outer_paths,
+            outer_paths=(
+                outer_paths
+            ),
             structural_paths=(
                 structural_paths
             ),
-            fine_paths=fine_paths,
+            fine_paths=(
+                fine_paths
+            ),
         )
 
         # ----------------------------------------------------
         # STATISTICS
         # ----------------------------------------------------
 
-        anchors = anchor_count(
+        anchors = count_anchors(
             all_paths
         )
 
-        average_length, (
-            short_fragments
+        (
+            average_length,
+            short_fragment_count,
+            fragmentation_ratio,
         ) = path_statistics(
             structural_paths
             + fine_paths
@@ -1955,27 +1695,12 @@ async def vectorize(
 
         warnings = []
 
-        if len(
-            all_paths
-        ) > 4000:
+        if len(all_paths) > 2500:
             warnings.append(
-                "Trace contains a very high number of paths."
+                "Trace contains a high number of paths."
             )
 
-        denominator = max(
-            1,
-            len(
-                structural_paths
-                + fine_paths
-            ),
-        )
-
-        fragment_ratio = (
-            short_fragments
-            / denominator
-        )
-
-        if fragment_ratio > 0.30:
+        if fragmentation_ratio > 0.25:
             warnings.append(
                 "Trace contains many short fragments."
             )
@@ -1988,79 +1713,27 @@ async def vectorize(
 
         if return_diagnostics:
 
-            combined_structural_skeleton = (
-                cv2.bitwise_or(
-                    horizontal_skeleton,
-                    vertical_skeleton,
-                )
-            )
-
-            combined_structural_skeleton = (
-                cv2.bitwise_or(
-                    combined_structural_skeleton,
-                    irregular_skeleton,
-                )
+            line_preview = draw_detected_lines(
+                enhanced,
+                horizontal,
+                vertical,
+                oblique,
             )
 
             diagnostics = {
                 "subjectMask":
-                    np_image_to_base64_png(
+                    image_to_base64_png(
                         subject_mask
                     ),
 
                 "enhancedGray":
-                    np_image_to_base64_png(
+                    image_to_base64_png(
                         enhanced
                     ),
 
-                "baseEdges":
-                    np_image_to_base64_png(
-                        edges
-                    ),
-
-                "horizontalMask":
-                    np_image_to_base64_png(
-                        horizontal_mask
-                    ),
-
-                "horizontalSkeleton":
-                    np_image_to_base64_png(
-                        horizontal_skeleton
-                    ),
-
-                "verticalMask":
-                    np_image_to_base64_png(
-                        vertical_mask
-                    ),
-
-                "verticalSkeleton":
-                    np_image_to_base64_png(
-                        vertical_skeleton
-                    ),
-
-                "irregularMask":
-                    np_image_to_base64_png(
-                        irregular_mask
-                    ),
-
-                "irregularSkeleton":
-                    np_image_to_base64_png(
-                        irregular_skeleton
-                    ),
-
-                "structuralSkeleton":
-                    np_image_to_base64_png(
-                        combined_structural_skeleton
-                    ),
-
-                "fineDetailMask":
-                    np_image_to_base64_png(
-                        detail_mask
-                    ),
-
-                "fineDetailSkeleton":
-                    np_image_to_base64_png(
-                        detail_skeleton
+                "structuralLinePreview":
+                    image_to_base64_png(
+                        line_preview
                     ),
             }
 
@@ -2074,22 +1747,44 @@ async def vectorize(
                 "label": "Outer Contour",
                 "paths": outer_paths,
             },
+
             {
                 "id": GROUP_STRUCTURAL,
                 "label": "Structural Lines",
                 "paths": structural_paths,
                 "subgroups": {
-                    "horizontal": (
-                        horizontal_paths
-                    ),
-                    "vertical": (
-                        vertical_paths
-                    ),
-                    "irregular": (
-                        irregular_paths
-                    ),
+                    "horizontal": [
+                        path
+                        for path
+                        in structural_paths
+                        if path.get(
+                            "orientation"
+                        )
+                        == "horizontal"
+                    ],
+
+                    "vertical": [
+                        path
+                        for path
+                        in structural_paths
+                        if path.get(
+                            "orientation"
+                        )
+                        == "vertical"
+                    ],
+
+                    "oblique": [
+                        path
+                        for path
+                        in structural_paths
+                        if path.get(
+                            "orientation"
+                        )
+                        == "oblique"
+                    ],
                 },
             },
+
             {
                 "id": GROUP_FINE,
                 "label": "Fine Detail",
@@ -2105,20 +1800,22 @@ async def vectorize(
             "success": True,
             "requestId": request_id,
 
-            # Keep this for Base44 compatibility.
+            # Keep Base44 contract stable.
             "provider": "opencv-potrace",
 
             "pipeline": PIPELINE_NAME,
-            "workerVersion": "0.4.0",
+            "workerVersion": "0.5.0",
 
             "width": width,
             "height": height,
-            "viewBox": (
-                f"0 0 {width} {height}"
-            ),
+
+            "viewBox":
+                f"0 0 {width} {height}",
 
             "svg": svg,
+
             "paths": all_paths,
+
             "groups": groups,
 
             "statistics": {
@@ -2132,7 +1829,9 @@ async def vectorize(
                     anchors,
 
                 "outerContourPathCount":
-                    len(outer_paths),
+                    len(
+                        outer_paths
+                    ),
 
                 "structuralPathCount":
                     len(
@@ -2141,17 +1840,17 @@ async def vectorize(
 
                 "horizontalStructuralPathCount":
                     len(
-                        horizontal_paths
+                        horizontal
                     ),
 
                 "verticalStructuralPathCount":
                     len(
-                        vertical_paths
+                        vertical
                     ),
 
-                "irregularStructuralPathCount":
+                "obliqueStructuralPathCount":
                     len(
-                        irregular_paths
+                        oblique
                     ),
 
                 "fineDetailPathCount":
@@ -2159,17 +1858,19 @@ async def vectorize(
                         fine_paths
                     ),
 
+                "rawDetectedLineCount":
+                    len(
+                        detected_lines
+                    ),
+
                 "averagePathLength":
                     average_length,
 
                 "shortFragmentCount":
-                    short_fragments,
+                    short_fragment_count,
 
                 "fragmentationRatio":
-                    round(
-                        fragment_ratio,
-                        4,
-                    ),
+                    fragmentation_ratio,
 
                 "processingTimeMs":
                     processing_ms,
@@ -2183,6 +1884,7 @@ async def vectorize(
             },
 
             "warnings": warnings,
+
             "diagnostics": diagnostics,
 
             "settingsUsed": {
