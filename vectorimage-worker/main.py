@@ -1168,12 +1168,10 @@ def health():
         potrace_ok = False
         potrace_version = "Unavailable"
 
-    thinning_ok = bool(
-        hasattr(
-            cv2,
-            "ximgproc",
-        )
-    )
+    thinning_ok = (
+    hasattr(cv2, "ximgproc")
+    and hasattr(cv2.ximgproc, "thinning")
+)
 
     return {
         "status": (
