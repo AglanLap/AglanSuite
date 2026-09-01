@@ -19,8 +19,8 @@ from fastapi.responses import JSONResponse
 # APPLICATION
 # ============================================================
 
-VERSION = "0.7.0"
-PIPELINE_NAME = "archaeological-roi-tracer-v1"
+VERSION = "0.7.1"
+PIPELINE_NAME = "archaeological-roi-tracer-v1.1"
 
 app = FastAPI(
     title="VectorImage Worker",
@@ -39,8 +39,6 @@ API_TOKEN = os.environ.get(
 
 GROUP_OUTER = "01_Outer_Contour"
 GROUP_GLOBAL = "02_Global_Structural"
-GROUP_GLOBAL_FINE = "03_Global_Fine"
-
 GROUP_ROI_PREFIX = "ROI"
 
 
@@ -48,12 +46,7 @@ GROUP_ROI_PREFIX = "ROI"
 # TYPES
 # ============================================================
 
-Line = Tuple[
-    float,
-    float,
-    float,
-    float,
-]
+Line = Tuple[float, float, float, float]
 
 
 # ============================================================
@@ -62,54 +55,76 @@ Line = Tuple[
 
 DEFAULT_PRESETS = {
 
-    # Central painted bands/grid
-   "painted_grid": {
-    "edgeThreshold": 34,
-    "minLineLength": 9,
-    "maxGap": 28,
-    "horizontalTolerance": 8,
-    "verticalTolerance": 7,
-    "fineDetail": True,
-    "fineCap": 650,
-    "irregularDetail": False,
-    "irregularCap": 0,
-},
+    # NEW v0.7.1:
+    # processed by trace_painted_grid(), not generic FLD.
+    "painted_grid": {
+        "detector": "painted_grid",
 
-    # Decoration, figures, ornaments, irregular paint
+        "edgeThreshold": 42,
+
+        # Morphological line extraction
+        "horizontalKernelPx": 25,
+        "verticalKernelPx": 11,
+
+        "horizontalThicknessPx": 3,
+        "verticalThicknessPx": 3,
+
+        "minimumHorizontalLength": 18,
+        "minimumVerticalLength": 7,
+
+        "minimumComponentArea": 10,
+
+        "horizontalGap": 20,
+        "verticalGap": 7,
+
+        "horizontalTolerance": 5,
+        "verticalTolerance": 4,
+
+        # Reject obviously non-grid components
+        "maximumObliqueAngle": 12,
+
+        "irregularDetail": False,
+        "irregularCap": 0,
+    },
+
     "ornament": {
+        "detector": "generic",
+
         "edgeThreshold": 38,
         "minLineLength": 8,
         "maxGap": 8,
+
         "horizontalTolerance": 5,
         "verticalTolerance": 5,
-        "fineDetail": True,
-        "fineCap": 500,
+
         "irregularDetail": True,
         "irregularCap": 350,
     },
 
-    # Wood grain, cracks and exposed surface
     "wood_texture": {
+        "detector": "generic",
+
         "edgeThreshold": 62,
         "minLineLength": 18,
         "maxGap": 8,
+
         "horizontalTolerance": 5,
         "verticalTolerance": 5,
-        "fineDetail": True,
-        "fineCap": 300,
+
         "irregularDetail": True,
         "irregularCap": 250,
     },
 
-    # Generic local recovery
     "general_detail": {
+        "detector": "generic",
+
         "edgeThreshold": 48,
         "minLineLength": 14,
         "maxGap": 12,
+
         "horizontalTolerance": 5,
         "verticalTolerance": 5,
-        "fineDetail": True,
-        "fineCap": 400,
+
         "irregularDetail": True,
         "irregularCap": 250,
     },
@@ -117,7 +132,7 @@ DEFAULT_PRESETS = {
 
 
 # ============================================================
-# AUTH / ERROR
+# AUTH / ERRORS
 # ============================================================
 
 def verify_token(
@@ -219,12 +234,6 @@ def apply_clahe(
 def build_subject_mask(
     image_bgr: np.ndarray,
 ) -> np.ndarray:
-    """
-    Baseline subject extraction intended for an object
-    photographed against a dark background.
-
-    Keeps the largest foreground component.
-    """
 
     gray = cv2.cvtColor(
         image_bgr,
@@ -284,7 +293,6 @@ def build_subject_mask(
         cv2.FILLED,
     )
 
-    # Slight dilation avoids clipping damaged edges.
     mask = cv2.dilate(
         mask,
         cv2.getStructuringElement(
@@ -364,7 +372,6 @@ def outer_contour_path(
         "group": GROUP_OUTER,
         "type": "outer-contour",
         "orientation": None,
-
         "lengthPx": 0,
     }
 
@@ -452,6 +459,7 @@ def normalize_line(
 
 # ============================================================
 # FAST LINE DETECTOR
+# Generic presets only
 # ============================================================
 
 def detect_lines(
@@ -765,7 +773,7 @@ def merge_vertical(
 
 
 # ============================================================
-# BASIC DEDUPLICATION
+# DEDUPLICATION
 # ============================================================
 
 def deduplicate_lines(
@@ -838,9 +846,7 @@ def line_to_path(
 
         "strokeLinecap": "round",
         "strokeLinejoin": "round",
-
-        "vectorEffect":
-            "non-scaling-stroke",
+        "vectorEffect": "non-scaling-stroke",
 
         "transform": None,
 
@@ -863,7 +869,7 @@ def line_to_path(
 
 
 # ============================================================
-# LINE TRACE FOR GLOBAL OR ROI
+# GENERIC REGION TRACE
 # ============================================================
 
 def trace_region_lines(
@@ -943,19 +949,18 @@ def trace_region_lines(
                 )
                 * 1.5
             ):
+
                 oblique_raw.append(
                     line
                 )
 
     horizontal = merge_horizontal(
         horizontal_raw,
-
         float(
             preset[
                 "horizontalTolerance"
             ]
         ),
-
         float(
             preset[
                 "maxGap"
@@ -965,13 +970,11 @@ def trace_region_lines(
 
     vertical = merge_vertical(
         vertical_raw,
-
         float(
             preset[
                 "verticalTolerance"
             ]
         ),
-
         float(
             preset[
                 "maxGap"
@@ -1021,13 +1024,9 @@ def trace_region_lines(
         paths.append(
             line_to_path(
                 global_line,
-
                 f"{group}_line_{i}",
-
                 group,
-
                 "line",
-
                 0.8,
             )
         )
@@ -1035,6 +1034,618 @@ def trace_region_lines(
     return (
         paths,
         global_lines,
+    )
+
+
+# ============================================================
+# NEW v0.7.1
+# PAINTED GRID EXTRACTION
+# ============================================================
+
+def adaptive_kernel_size(
+    requested: int,
+    roi_dimension: int,
+    minimum: int,
+    maximum_fraction: float,
+) -> int:
+    """
+    Prevent fixed morphology kernels becoming absurdly
+    large/small on differently sized ROIs.
+    """
+
+    maximum = max(
+        minimum,
+        int(
+            roi_dimension
+            * maximum_fraction
+        ),
+    )
+
+    value = int(
+        clamp(
+            requested,
+            minimum,
+            maximum,
+        )
+    )
+
+    # Odd values are generally safer for morphology.
+    if value % 2 == 0:
+        value += 1
+
+    return value
+
+
+def extract_component_lines(
+    binary: np.ndarray,
+    orientation: str,
+    min_length: int,
+    min_area: int,
+) -> List[Line]:
+
+    count, labels, stats, centroids = (
+        cv2.connectedComponentsWithStats(
+            (
+                binary > 0
+            ).astype(
+                np.uint8
+            ),
+            connectivity=8,
+        )
+    )
+
+    lines = []
+
+    for label in range(
+        1,
+        count,
+    ):
+
+        area = int(
+            stats[
+                label,
+                cv2.CC_STAT_AREA,
+            ]
+        )
+
+        if area < min_area:
+            continue
+
+        x = int(
+            stats[
+                label,
+                cv2.CC_STAT_LEFT,
+            ]
+        )
+
+        y = int(
+            stats[
+                label,
+                cv2.CC_STAT_TOP,
+            ]
+        )
+
+        w = int(
+            stats[
+                label,
+                cv2.CC_STAT_WIDTH,
+            ]
+        )
+
+        h = int(
+            stats[
+                label,
+                cv2.CC_STAT_HEIGHT,
+            ]
+        )
+
+        if orientation == "horizontal":
+
+            if w < min_length:
+                continue
+
+            # Reject compact blobs.
+            if w < (
+                h * 1.5
+            ):
+                continue
+
+            cy = float(
+                centroids[
+                    label
+                ][1]
+            )
+
+            line = (
+                float(x),
+                cy,
+                float(
+                    x + w - 1
+                ),
+                cy,
+            )
+
+        else:
+
+            if h < min_length:
+                continue
+
+            if h < (
+                w * 1.3
+            ):
+                continue
+
+            cx = float(
+                centroids[
+                    label
+                ][0]
+            )
+
+            line = (
+                cx,
+                float(y),
+                cx,
+                float(
+                    y + h - 1
+                ),
+            )
+
+        lines.append(
+            line
+        )
+
+    return lines
+
+
+def trace_painted_grid(
+    image_gray: np.ndarray,
+    mask: np.ndarray,
+    preset: Dict[str, Any],
+    offset_x: int,
+    offset_y: int,
+    group: str,
+) -> Tuple[
+    List[Dict[str, Any]],
+    List[Line],
+    Dict[str, Any],
+]:
+
+    # --------------------------------------------------------
+    # PREPROCESS
+    # --------------------------------------------------------
+
+    working = cv2.bilateralFilter(
+        image_gray,
+        7,
+        30,
+        30,
+    )
+
+    working = apply_clahe(
+        working
+    )
+
+    # Background to black because we use bright-feature
+    # morphology inside the ROI.
+    working_masked = np.zeros_like(
+        working
+    )
+
+    working_masked[
+        mask > 0
+    ] = working[
+        mask > 0
+    ]
+
+
+    # --------------------------------------------------------
+    # ENHANCE LOCAL LIGHT FEATURES
+    # --------------------------------------------------------
+
+    # White top-hat enhances relatively bright painted bands
+    # against a darker painted field.
+    illumination_kernel = (
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (15, 15),
+        )
+    )
+
+    top_hat = cv2.morphologyEx(
+        working_masked,
+        cv2.MORPH_TOPHAT,
+        illumination_kernel,
+    )
+
+    # Blend enhanced local contrast back with original.
+    enhanced = cv2.addWeighted(
+        working_masked,
+        0.45,
+        top_hat,
+        1.4,
+        0,
+    )
+
+
+    # --------------------------------------------------------
+    # ADAPTIVE KERNEL SIZES
+    # --------------------------------------------------------
+
+    roi_height, roi_width = (
+        image_gray.shape[:2]
+    )
+
+    horizontal_kernel_width = (
+        adaptive_kernel_size(
+            int(
+                preset.get(
+                    "horizontalKernelPx",
+                    25,
+                )
+            ),
+            roi_width,
+            minimum=9,
+            maximum_fraction=0.10,
+        )
+    )
+
+    horizontal_kernel_height = max(
+        1,
+        int(
+            preset.get(
+                "horizontalThicknessPx",
+                3,
+            )
+        ),
+    )
+
+    vertical_kernel_height = (
+        adaptive_kernel_size(
+            int(
+                preset.get(
+                    "verticalKernelPx",
+                    11,
+                )
+            ),
+            roi_height,
+            minimum=5,
+            maximum_fraction=0.08,
+        )
+    )
+
+    vertical_kernel_width = max(
+        1,
+        int(
+            preset.get(
+                "verticalThicknessPx",
+                3,
+            )
+        ),
+    )
+
+
+    # --------------------------------------------------------
+    # THRESHOLD BRIGHT STRUCTURE
+    # --------------------------------------------------------
+
+    _, bright_binary = cv2.threshold(
+        enhanced,
+        0,
+        255,
+        cv2.THRESH_BINARY
+        + cv2.THRESH_OTSU,
+    )
+
+    bright_binary = cv2.bitwise_and(
+        bright_binary,
+        bright_binary,
+        mask=mask,
+    )
+
+
+    # --------------------------------------------------------
+    # HORIZONTAL MORPHOLOGY
+    # --------------------------------------------------------
+
+    horizontal_kernel = (
+        cv2.getStructuringElement(
+            cv2.MORPH_RECT,
+            (
+                horizontal_kernel_width,
+                horizontal_kernel_height,
+            ),
+        )
+    )
+
+    horizontal_mask = (
+        cv2.morphologyEx(
+            bright_binary,
+            cv2.MORPH_OPEN,
+            horizontal_kernel,
+        )
+    )
+
+    horizontal_close_kernel = (
+        cv2.getStructuringElement(
+            cv2.MORPH_RECT,
+            (
+                max(
+                    3,
+                    int(
+                        preset.get(
+                            "horizontalGap",
+                            20,
+                        )
+                        // 2
+                    ),
+                ),
+                1,
+            ),
+        )
+    )
+
+    horizontal_mask = (
+        cv2.morphologyEx(
+            horizontal_mask,
+            cv2.MORPH_CLOSE,
+            horizontal_close_kernel,
+        )
+    )
+
+
+    # --------------------------------------------------------
+    # VERTICAL MORPHOLOGY
+    # --------------------------------------------------------
+
+    vertical_kernel = (
+        cv2.getStructuringElement(
+            cv2.MORPH_RECT,
+            (
+                vertical_kernel_width,
+                vertical_kernel_height,
+            ),
+        )
+    )
+
+    vertical_mask = (
+        cv2.morphologyEx(
+            bright_binary,
+            cv2.MORPH_OPEN,
+            vertical_kernel,
+        )
+    )
+
+    vertical_close_kernel = (
+        cv2.getStructuringElement(
+            cv2.MORPH_RECT,
+            (
+                1,
+                max(
+                    3,
+                    int(
+                        preset.get(
+                            "verticalGap",
+                            7,
+                        )
+                    ),
+                ),
+            ),
+        )
+    )
+
+    vertical_mask = (
+        cv2.morphologyEx(
+            vertical_mask,
+            cv2.MORPH_CLOSE,
+            vertical_close_kernel,
+        )
+    )
+
+
+    # --------------------------------------------------------
+    # COMPONENT → CENTERLINE
+    # --------------------------------------------------------
+
+    minimum_component_area = int(
+        preset.get(
+            "minimumComponentArea",
+            10,
+        )
+    )
+
+    horizontal_lines = (
+        extract_component_lines(
+            horizontal_mask,
+            "horizontal",
+
+            min_length=int(
+                preset.get(
+                    "minimumHorizontalLength",
+                    18,
+                )
+            ),
+
+            min_area=(
+                minimum_component_area
+            ),
+        )
+    )
+
+    vertical_lines = (
+        extract_component_lines(
+            vertical_mask,
+            "vertical",
+
+            min_length=int(
+                preset.get(
+                    "minimumVerticalLength",
+                    7,
+                )
+            ),
+
+            min_area=max(
+                5,
+                minimum_component_area
+                // 2,
+            ),
+        )
+    )
+
+
+    # --------------------------------------------------------
+    # MERGE
+    # --------------------------------------------------------
+
+    horizontal_lines = merge_horizontal(
+        horizontal_lines,
+
+        y_tolerance=float(
+            preset.get(
+                "horizontalTolerance",
+                5,
+            )
+        ),
+
+        gap=float(
+            preset.get(
+                "horizontalGap",
+                20,
+            )
+        ),
+    )
+
+    vertical_lines = merge_vertical(
+        vertical_lines,
+
+        x_tolerance=float(
+            preset.get(
+                "verticalTolerance",
+                4,
+            )
+        ),
+
+        gap=float(
+            preset.get(
+                "verticalGap",
+                7,
+            )
+        ),
+    )
+
+    horizontal_lines = deduplicate_lines(
+        horizontal_lines
+    )
+
+    vertical_lines = deduplicate_lines(
+        vertical_lines
+    )
+
+
+    # --------------------------------------------------------
+    # GLOBAL COORDINATES
+    # --------------------------------------------------------
+
+    local_lines = (
+        horizontal_lines
+        + vertical_lines
+    )
+
+    global_lines = []
+    paths = []
+
+    horizontal_count = 0
+    vertical_count = 0
+
+    for index, line in enumerate(
+        local_lines,
+        start=1,
+    ):
+
+        x1, y1, x2, y2 = line
+
+        global_line = (
+            x1 + offset_x,
+            y1 + offset_y,
+            x2 + offset_x,
+            y2 + offset_y,
+        )
+
+        global_lines.append(
+            global_line
+        )
+
+        orientation = (
+            classify_orientation(
+                global_line
+            )
+        )
+
+        if orientation == "horizontal":
+            horizontal_count += 1
+            stroke_width = 0.9
+
+        else:
+            vertical_count += 1
+            stroke_width = 0.75
+
+        paths.append(
+            line_to_path(
+                global_line,
+
+                f"{group}_grid_{index}",
+
+                group,
+
+                "painted-grid",
+
+                stroke_width,
+            )
+        )
+
+
+    diagnostics = {
+
+        "detector":
+            "painted_grid_morphology",
+
+        "horizontalCount":
+            horizontal_count,
+
+        "verticalCount":
+            vertical_count,
+
+        "horizontalKernel":
+            [
+                horizontal_kernel_width,
+                horizontal_kernel_height,
+            ],
+
+        "verticalKernel":
+            [
+                vertical_kernel_width,
+                vertical_kernel_height,
+            ],
+
+        "brightBinary":
+            image_to_base64_png(
+                bright_binary
+            ),
+
+        "horizontalMask":
+            image_to_base64_png(
+                horizontal_mask
+            ),
+
+        "verticalMask":
+            image_to_base64_png(
+                vertical_mask
+            ),
+    }
+
+    return (
+        paths,
+        global_lines,
+        diagnostics,
     )
 
 
@@ -1062,6 +1673,7 @@ def skeletonize(
             "thinning",
         )
     ):
+
         return cv2.ximgproc.thinning(
             binary,
 
@@ -1071,7 +1683,6 @@ def skeletonize(
             ),
         )
 
-    # Fallback.
     skeleton = np.zeros_like(
         binary
     )
@@ -1116,7 +1727,7 @@ def skeletonize(
 
 
 # ============================================================
-# IRREGULAR ROI DETAIL
+# IRREGULAR DETAIL
 # ============================================================
 
 def irregular_paths(
@@ -1150,7 +1761,6 @@ def irregular_paths(
         mask=mask,
     )
 
-    # Suppress straight geometry already represented.
     line_mask = np.zeros_like(
         edges
     )
@@ -1159,7 +1769,6 @@ def irregular_paths(
 
         x1, y1, x2, y2 = line
 
-        # Convert global coordinates back to ROI-local.
         lx1 = int(
             round(
                 x1 - offset_x
@@ -1411,13 +2020,14 @@ def irregular_paths(
             if len(
                 paths
             ) >= max_paths:
+
                 return paths
 
     return paths
 
 
 # ============================================================
-# ROI VALIDATION
+# ROI NORMALIZATION
 # ============================================================
 
 def normalize_roi(
@@ -1454,11 +2064,6 @@ def normalize_roi(
         )
     )
 
-    if image_width <= 0 or image_height <= 0:
-        raise ValueError(
-            "Invalid source image dimensions"
-        )
-
     x = clamp(
         x,
         0,
@@ -1491,6 +2096,7 @@ def normalize_roi(
     )
 
     if preset not in DEFAULT_PRESETS:
+
         preset = "general_detail"
 
     mode = str(
@@ -1504,31 +2110,42 @@ def normalize_roi(
         "replace",
         "add",
     ):
+
         mode = "replace"
 
     return {
         **roi,
 
-        "id": str(
-            roi.get(
-                "id",
-                "",
-            )
-        ),
+        "id":
+            str(
+                roi.get(
+                    "id",
+                    "",
+                )
+            ),
 
-        "x": x,
-        "y": y,
+        "x":
+            x,
 
-        "width": width,
-        "height": height,
+        "y":
+            y,
 
-        "preset": preset,
-        "mode": mode,
+        "width":
+            width,
+
+        "height":
+            height,
+
+        "preset":
+            preset,
+
+        "mode":
+            mode,
     }
 
 
 # ============================================================
-# PATH / ROI INTERSECTION
+# PATH / ROI TEST
 # ============================================================
 
 def path_inside_roi(
@@ -1711,6 +2328,7 @@ def path_statistics(
     ]
 
     if not lengths:
+
         return (
             0.0,
             0,
@@ -1718,8 +2336,12 @@ def path_statistics(
         )
 
     average = (
-        sum(lengths)
-        / len(lengths)
+        sum(
+            lengths
+        )
+        / len(
+            lengths
+        )
     )
 
     short_count = sum(
@@ -1730,7 +2352,9 @@ def path_statistics(
 
     fragmentation = (
         short_count
-        / len(lengths)
+        / len(
+            lengths
+        )
     )
 
     return (
@@ -1846,6 +2470,9 @@ def health():
         "roiSupport":
             True,
 
+        "paintedGridDetector":
+            "morphology-v1",
+
         "roiPresets":
             list(
                 DEFAULT_PRESETS.keys()
@@ -1877,10 +2504,6 @@ async def vectorize(
         + secrets.token_hex(6)
     )
 
-    # --------------------------------------------------------
-    # SETTINGS
-    # --------------------------------------------------------
-
     try:
 
         config = json.loads(
@@ -1890,10 +2513,6 @@ async def vectorize(
     except Exception:
 
         config = {}
-
-    # --------------------------------------------------------
-    # IMAGE
-    # --------------------------------------------------------
 
     content = await image.read()
 
@@ -1958,6 +2577,7 @@ async def vectorize(
         )
 
         if not ignore_background:
+
             subject_mask[:] = 255
 
 
@@ -1965,15 +2585,7 @@ async def vectorize(
         # GROUP STORAGE
         # ====================================================
 
-        grouped_paths: Dict[
-            str,
-            List[
-                Dict[
-                    str,
-                    Any,
-                ]
-            ],
-        ] = {}
+        grouped_paths = {}
 
 
         # ====================================================
@@ -1998,6 +2610,9 @@ async def vectorize(
         # ====================================================
 
         global_preset = {
+
+            "detector":
+                "generic",
 
             "edgeThreshold":
                 int(
@@ -2028,12 +2643,6 @@ async def vectorize(
 
             "verticalTolerance":
                 6,
-
-            "fineDetail":
-                False,
-
-            "fineCap":
-                0,
 
             "irregularDetail":
                 False,
@@ -2074,6 +2683,7 @@ async def vectorize(
             roi_input,
             list,
         ):
+
             roi_input = []
 
         normalized_rois = []
@@ -2101,6 +2711,8 @@ async def vectorize(
 
         roi_reports = []
 
+        roi_algorithm_diagnostics = {}
+
         for index, roi in enumerate(
             normalized_rois,
             start=1,
@@ -2116,7 +2728,6 @@ async def vectorize(
                 ]
             )
 
-            # Optional ROI-specific overrides.
             roi_settings = roi.get(
                 "settings",
                 {},
@@ -2126,6 +2737,7 @@ async def vectorize(
                 roi_settings,
                 dict,
             ):
+
                 preset.update(
                     roi_settings
                 )
@@ -2157,72 +2769,102 @@ async def vectorize(
                 f"{preset_name}"
             )
 
-            # ------------------------------------------------
-            # ROI STRAIGHT / STRUCTURAL TRACE
-            # ------------------------------------------------
 
-            (
-                roi_paths,
-                roi_geometry,
-            ) = trace_region_lines(
-                crop_gray,
-                crop_mask,
-                preset,
+            # =================================================
+            # SPECIALIZED DISPATCH
+            # =================================================
 
-                offset_x=x,
-                offset_y=y,
-
-                group=group_id,
+            detector_type = preset.get(
+                "detector",
+                "generic",
             )
 
-            # ------------------------------------------------
-            # ROI IRREGULAR DETAIL
-            # ------------------------------------------------
+            if detector_type == "painted_grid":
 
-            irregular_count = 0
+                (
+                    roi_paths,
+                    roi_geometry,
+                    grid_diagnostics,
+                ) = trace_painted_grid(
+                    image_gray=crop_gray,
 
-            if bool(
-                preset.get(
-                    "irregularDetail",
-                    False,
+                    mask=crop_mask,
+
+                    preset=preset,
+
+                    offset_x=x,
+                    offset_y=y,
+
+                    group=group_id,
                 )
-            ):
 
-                irregular = (
-                    irregular_paths(
-                        image_gray=crop_gray,
+                roi_algorithm_diagnostics[
+                    group_id
+                ] = grid_diagnostics
 
-                        mask=crop_mask,
+                irregular_count = 0
 
-                        existing_lines=(
-                            roi_geometry
-                        ),
+            else:
 
-                        offset_x=x,
-                        offset_y=y,
+                (
+                    roi_paths,
+                    roi_geometry,
+                ) = trace_region_lines(
+                    crop_gray,
+                    crop_mask,
+                    preset,
 
-                        group=group_id,
+                    offset_x=x,
+                    offset_y=y,
 
-                        max_paths=int(
-                            preset.get(
-                                "irregularCap",
-                                250,
-                            )
-                        ),
+                    group=group_id,
+                )
+
+                irregular_count = 0
+
+                if bool(
+                    preset.get(
+                        "irregularDetail",
+                        False,
                     )
-                )
+                ):
 
-                irregular_count = len(
-                    irregular
-                )
+                    irregular = (
+                        irregular_paths(
+                            image_gray=crop_gray,
 
-                roi_paths.extend(
-                    irregular
-                )
+                            mask=crop_mask,
 
-            # ------------------------------------------------
-            # REPLACE MODE
-            # ------------------------------------------------
+                            existing_lines=(
+                                roi_geometry
+                            ),
+
+                            offset_x=x,
+                            offset_y=y,
+
+                            group=group_id,
+
+                            max_paths=int(
+                                preset.get(
+                                    "irregularCap",
+                                    250,
+                                )
+                            ),
+                        )
+                    )
+
+                    irregular_count = len(
+                        irregular
+                    )
+
+                    roi_paths.extend(
+                        irregular
+                    )
+
+
+            # =================================================
+            # REPLACE GLOBAL GEOMETRY
+            # =================================================
 
             if roi[
                 "mode"
@@ -2242,9 +2884,11 @@ async def vectorize(
                     )
                 ]
 
+
             grouped_paths[
                 group_id
             ] = roi_paths
+
 
             roi_reports.append(
                 {
@@ -2262,6 +2906,9 @@ async def vectorize(
 
                     "preset":
                         preset_name,
+
+                    "detector":
+                        detector_type,
 
                     "mode":
                         roi[
@@ -2306,16 +2953,15 @@ async def vectorize(
 
 
         # ====================================================
-        # FINAL PATH COLLECTION
+        # FINAL COLLECTION
         # ====================================================
 
         all_paths = []
         groups = []
 
-        for (
-            group_id,
-            paths,
-        ) in grouped_paths.items():
+        for group_id, paths in (
+            grouped_paths.items()
+        ):
 
             all_paths.extend(
                 paths
@@ -2443,9 +3089,12 @@ async def vectorize(
                         group[
                             "id"
                         ]
-                        for group
-                        in groups
+                        for group in groups
                     ],
+
+                # NEW v0.7.1
+                "roiAlgorithms":
+                    roi_algorithm_diagnostics,
             }
 
 
@@ -2470,7 +3119,6 @@ async def vectorize(
             "workerVersion":
                 VERSION,
 
-            # Also expose plain version for easier clients.
             "version":
                 VERSION,
 
@@ -2492,7 +3140,6 @@ async def vectorize(
             "groups":
                 groups,
 
-            # CRITICAL FOR BASE44 ROI DIAGNOSTICS
             "rois":
                 roi_reports,
 
