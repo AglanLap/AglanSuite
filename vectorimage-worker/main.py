@@ -63,17 +63,17 @@ Line = Tuple[
 DEFAULT_PRESETS = {
 
     # Central painted bands/grid
-    "painted_grid": {
-        "edgeThreshold": 45,
-        "minLineLength": 16,
-        "maxGap": 18,
-        "horizontalTolerance": 6,
-        "verticalTolerance": 6,
-        "fineDetail": True,
-        "fineCap": 450,
-        "irregularDetail": False,
-        "irregularCap": 0,
-    },
+   "painted_grid": {
+    "edgeThreshold": 34,
+    "minLineLength": 9,
+    "maxGap": 28,
+    "horizontalTolerance": 8,
+    "verticalTolerance": 7,
+    "fineDetail": True,
+    "fineCap": 650,
+    "irregularDetail": False,
+    "irregularCap": 0,
+},
 
     # Decoration, figures, ornaments, irregular paint
     "ornament": {
